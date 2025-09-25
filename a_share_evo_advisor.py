@@ -1,20 +1,23 @@
-
 # -*- coding: utf-8 -*-
 """
-A股“进化式”投研助手（重构升级版，单文件 GUI）
+A股“进化式”投研助手（重构优化版，单文件 GUI）
 - 数据源：baostock
 - 增量下载：仅拉取新增交易日
 - 量化特征：SMA/EMA/MACD/RSI/ATR/BOLL/KDJ/CCI/WR/OBV/MFI/CMF/BBP/Range/Gap/动量等
 - 模型训练：
     * 岭回归（时间序列CV自动选 λ，目标可选 IC 或 MSE）
     * 遗传算法（特征子集+正则λ，目标最大化验证Rank IC）
-- 市场扫描：HS300/ZZ500/SZ50/ALL/CUSTOM（文件导入）
-    * 优质股评分：预测Z分/动量Z分/波动Z分/趋势/突破/回撤综合；高级筛选与阈值可调
-    * 可选跳过ALL全量前置更新、批量扫描降低接口压力
+- 市场扫描：
+    * 支持 HS300/ZZ500/SZ50/ALL/CUSTOM
+    * 无权重时自动使用“基线打分”也可扫描（不再依赖训练）
+    * 高级筛选：趋势/接近55日高/波动Z阈值/RSI区间/流动性阈值
 - 扩展建议：结合预测、动量、波动、ATR给出仓位/止损/止盈/数量
-- 绩效评估优化：按日期/类型筛选、导出CSV、分位统计、分布图
-- 持久化：SQLite（价格、建议、权重、元信息）
-- GUI：tkinter + matplotlib + Notebook 分页 + 异步线程
+- 回测：TopN选股 + H日持有 + 交易费率，输出年化/回撤/Sharpe/胜率，绘制净值曲线
+- 绩效评估：按日期/类型筛选、导出CSV、分位统计、分布图
+- 用户操作：记录每日操作（买/卖/调仓），计算盈亏，给出风险提示（连续化进化的基础数据）
+- 持久化：SQLite（价格、名称、建议、权重、元信息、用户操作）
+- GUI：tkinter + matplotlib + Notebook 分页 + 异步线程 + 进度条 + 滚动条
+- 低门槛：去掉预设股票，支持股票名称展示，增加“从指数填充”“从文件导入”，丰富使用说明
 
 依赖:
     pip install baostock pandas numpy matplotlib
@@ -139,52 +142,73 @@ def get_conn():
 def init_db():
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""
-              CREATE TABLE IF NOT EXISTS prices
-              (
-                  code   TEXT NOT NULL,
-                  date   TEXT NOT NULL,
-                  open   REAL,
-                  high   REAL,
-                  low    REAL,
-                  close  REAL,
-                  volume REAL,
-                  amount REAL,
-                  PRIMARY KEY (code, date)
-              )
+    c.execute("""  
+              CREATE TABLE IF NOT EXISTS prices  
+              (  
+                  code   TEXT NOT NULL,  
+                  date   TEXT NOT NULL,  
+                  open   REAL,  
+                  high   REAL,  
+                  low    REAL,  
+                  close  REAL,  
+                  volume REAL,  
+                  amount REAL,  
+                  PRIMARY KEY (code, date)  
+              )  
               """)
-    c.execute("""
-              CREATE TABLE IF NOT EXISTS advice
-              (
-                  id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                  date      TEXT NOT NULL,
-                  code      TEXT NOT NULL,
-                  score     REAL,
-                  advice    TEXT,
-                  reasoning TEXT,
-                  horizon   INTEGER
-              )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(date)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_prices_code ON prices(code)")
+    c.execute("""  
+              CREATE TABLE IF NOT EXISTS advice  
+              (  
+                  id        INTEGER PRIMARY KEY AUTOINCREMENT,  
+                  date      TEXT NOT NULL,  
+                  code      TEXT NOT NULL,  
+                  score     REAL,  
+                  advice    TEXT,  
+                  reasoning TEXT,  
+                  horizon   INTEGER  
+              )  
               """)
-    c.execute("""
-              CREATE TABLE IF NOT EXISTS weights
-              (
-                  timestamp TEXT PRIMARY KEY,
-                  horizon   INTEGER,
-                  features  TEXT,
-                  weights   TEXT,
-                  intercept REAL,
-                  mu        TEXT,
-                  sigma     TEXT,
-                  lambda    REAL,
-                  notes     TEXT
-              )
+    c.execute("""  
+              CREATE TABLE IF NOT EXISTS weights  
+              (  
+                  timestamp TEXT PRIMARY KEY,  
+                  horizon   INTEGER,  
+                  features  TEXT,  
+                  weights   TEXT,  
+                  intercept REAL,  
+                  mu        TEXT,  
+                  sigma     TEXT,  
+                  lambda    REAL,  
+                  notes     TEXT  
+              )  
               """)
-    c.execute("""
-              CREATE TABLE IF NOT EXISTS meta
-              (
-                  key TEXT PRIMARY KEY,
-                  value TEXT
-              )
+    c.execute("""  
+              CREATE TABLE IF NOT EXISTS meta  
+              (  
+                  key TEXT PRIMARY KEY,  
+                  value TEXT  
+              )  
+              """)
+    c.execute("""  
+              CREATE TABLE IF NOT EXISTS stock_names  
+              (  
+                  code TEXT PRIMARY KEY,  
+                  name TEXT  
+              )  
+              """)
+    c.execute("""  
+              CREATE TABLE IF NOT EXISTS user_ops  
+              (  
+                  id        INTEGER PRIMARY KEY AUTOINCREMENT,  
+                  date      TEXT NOT NULL,  
+                  code      TEXT NOT NULL,  
+                  action    TEXT NOT NULL,   -- BUY/SELL/ADJ  
+                  price     REAL,  
+                  qty       INTEGER,  
+                  note      TEXT  
+              )  
               """)
     conn.commit()
     conn.close()
@@ -202,9 +226,9 @@ def upsert_prices(code: str, df: pd.DataFrame):
             safe_float(r.get("low")), safe_float(r.get("close")),
             safe_float(r.get("volume")), safe_float(r.get("amount"))
         ))
-    c.executemany("""
-        INSERT OR REPLACE INTO prices (code, date, open, high, low, close, volume, amount)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    c.executemany("""  
+        INSERT OR REPLACE INTO prices (code, date, open, high, low, close, volume, amount)  
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)  
     """, rows)
     conn.commit()
     conn.close()
@@ -223,28 +247,28 @@ def load_price_df(code: str, start_date: Optional[str] = None, end_date: Optiona
     conn = get_conn()
     c = conn.cursor()
     if start_date and end_date:
-        c.execute("""
-                  SELECT date, open, high, low, close, volume, amount
-                  FROM prices
-                  WHERE code = ?
-                    AND date >= ?
-                    AND date <= ?
-                  ORDER BY date ASC
+        c.execute("""  
+                  SELECT date, open, high, low, close, volume, amount  
+                  FROM prices  
+                  WHERE code = ?  
+                    AND date >= ?  
+                    AND date <= ?  
+                  ORDER BY date ASC  
                   """, (code, start_date, end_date))
     elif start_date:
-        c.execute("""
-                  SELECT date, open, high, low, close, volume, amount
-                  FROM prices
-                  WHERE code = ?
-                    AND date >= ?
-                  ORDER BY date ASC
+        c.execute("""  
+                  SELECT date, open, high, low, close, volume, amount  
+                  FROM prices  
+                  WHERE code = ?  
+                    AND date >= ?  
+                  ORDER BY date ASC  
                   """, (code, start_date))
     else:
-        c.execute("""
-                  SELECT date, open, high, low, close, volume, amount
-                  FROM prices
-                  WHERE code = ?
-                  ORDER BY date ASC
+        c.execute("""  
+                  SELECT date, open, high, low, close, volume, amount  
+                  FROM prices  
+                  WHERE code = ?  
+                  ORDER BY date ASC  
                   """, (code,))
     rows = c.fetchall()
     conn.close()
@@ -261,9 +285,9 @@ def insert_advice(records: List[Tuple[str, str, float, str, str, int]]):
         return
     conn = get_conn()
     c = conn.cursor()
-    c.executemany("""
-                  INSERT INTO advice (date, code, score, advice, reasoning, horizon)
-                  VALUES (?, ?, ?, ?, ?, ?)
+    c.executemany("""  
+                  INSERT INTO advice (date, code, score, advice, reasoning, horizon)  
+                  VALUES (?, ?, ?, ?, ?, ?)  
                   """, records)
     conn.commit()
     conn.close()
@@ -277,10 +301,10 @@ def query_advice(code: Optional[str] = None, limit: int = 200,
     """
     conn = get_conn()
     c = conn.cursor()
-    sql = """
-        SELECT date, code, score, advice, reasoning, horizon
-        FROM advice
-        WHERE 1=1
+    sql = """  
+        SELECT date, code, score, advice, reasoning, horizon  
+        FROM advice  
+        WHERE 1=1  
     """
     params: List[Any] = []
     if code:
@@ -310,9 +334,9 @@ def save_weights_record(horizon: int, features: List[str], weights: np.ndarray, 
     conn = get_conn()
     c = conn.cursor()
     ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    c.execute("""
-        INSERT OR REPLACE INTO weights (timestamp, horizon, features, weights, intercept, mu, sigma, lambda, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    c.execute("""  
+        INSERT OR REPLACE INTO weights (timestamp, horizon, features, weights, intercept, mu, sigma, lambda, notes)  
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)  
     """, (
         ts, int(horizon), json.dumps(features), json.dumps(list(map(float, weights))),
         float(intercept), json.dumps(list(map(float, mu))), json.dumps(list(map(float, sigma))),
@@ -333,9 +357,9 @@ def load_latest_weights() -> Optional[Dict[str, Any]]:
         conn.close()
         return None
     ts = row[0]
-    c.execute("""
-              SELECT timestamp, horizon, features, weights, intercept, mu, sigma, lambda, notes
-              FROM weights WHERE timestamp = ?
+    c.execute("""  
+              SELECT timestamp, horizon, features, weights, intercept, mu, sigma, lambda, notes  
+              FROM weights WHERE timestamp = ?  
               """, (ts,))
     w = c.fetchone()
     conn.close()
@@ -352,6 +376,40 @@ def load_latest_weights() -> Optional[Dict[str, Any]]:
         "lambda": float(w[7]),
         "notes": w[8] or ""
     }
+
+
+def set_stock_name(code: str, name: Optional[str]):
+    if not code:
+        return
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO stock_names(code, name) VALUES(?,?)", (code, name or ""))
+    conn.commit()
+    conn.close()
+
+
+def get_stock_name(code: str) -> str:
+    if not code:
+        return ""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT name FROM stock_names WHERE code=?", (code,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else ""
+
+
+def get_name_map(codes: List[str]) -> Dict[str, str]:
+    if not codes:
+        return {}
+    conn = get_conn()
+    c = conn.cursor()
+    qmarks = ",".join(["?"] * len(codes))
+    c.execute(f"SELECT code, name FROM stock_names WHERE code IN ({qmarks})", tuple(codes))
+    rows = c.fetchall()
+    conn.close()
+    mp = {r[0]: (r[1] or "") for r in rows}
+    return mp
 
 
 # =========================== baostock 接入 ===========================
@@ -418,6 +476,24 @@ def fetch_k_data_incremental(code: str, start_date: str, end_date: Optional[str]
                 raise
             time.sleep(sleep_sec)
     return pd.DataFrame()
+
+
+def fetch_and_cache_name(code: str):
+    """
+    通过 baostock 获取并缓存股票名称
+    """
+    try:
+        if bs is None:
+            return
+        rs = bs.query_stock_basic(code=code)
+        if rs.error_code == '0' and rs.next():
+            row = rs.get_row_data()
+            # row: [code, code_name, ipoDate, outDate, type, status]
+            name = row[1]
+            if name:
+                set_stock_name(code, name)
+    except Exception:
+        pass
 
 
 # =========================== 特征工程与信号 ===========================
@@ -950,20 +1026,45 @@ def get_market_codes(index_flag: str, on_date: str) -> List[str]:
     if bs is None:
         raise RuntimeError("未安装 baostock，无法获取指数成分")
     codes = []
+    names = []
     if index_flag == "HS300":
         rs = bs.query_hs300_stocks(date=on_date)
+        while rs.error_code == '0' and rs.next():
+            row = rs.get_row_data()
+            code = row[1]
+            name = row[2] if len(row) > 2 else ""
+            if code and (code.startswith("sh.") or code.startswith("sz.")):
+                codes.append(code); names.append(name)
     elif index_flag == "ZZ500":
         rs = bs.query_zz500_stocks(date=on_date)
+        while rs.error_code == '0' and rs.next():
+            row = rs.get_row_data()
+            code = row[1]
+            name = row[2] if len(row) > 2 else ""
+            if code and (code.startswith("sh.") or code.startswith("sz.")):
+                codes.append(code); names.append(name)
     elif index_flag == "SZ50":
         rs = bs.query_sz50_stocks(date=on_date)
+        while rs.error_code == '0' and rs.next():
+            row = rs.get_row_data()
+            code = row[1]
+            name = row[2] if len(row) > 2 else ""
+            if code and (code.startswith("sh.") or code.startswith("sz.")):
+                codes.append(code); names.append(name)
     else:
         rs = bs.query_all_stock(day=on_date)
-    while rs.error_code == '0' and rs.next():
-        row = rs.get_row_data()
-        code = row[1] if index_flag in ("HS300", "ZZ500", "SZ50") else row[0]
-        if code and (code.startswith("sh.") or code.startswith("sz.")):
-            codes.append(code)
+        while rs.error_code == '0' and rs.next():
+            row = rs.get_row_data()
+            code = row[0]
+            if code and (code.startswith("sh.") or code.startswith("sz.")):
+                codes.append(code)
+    # 去重&排序
     codes = sorted(list(set(codes)))
+    # 缓存名称（指数场景可批量缓存）
+    if names:
+        for code, name in zip(codes, names):
+            if name:
+                set_stock_name(code, name)
     return codes
 
 
@@ -980,6 +1081,8 @@ def update_data_for_codes(codes: List[str], start_date: str, end_date: str, adju
             else:
                 if logger:
                     logger(f"{code} 无新增")
+            # 缓存名称
+            fetch_and_cache_name(code)
             time.sleep(0.06)
         except Exception as e:
             if logger:
@@ -1025,8 +1128,26 @@ def quality_score_advanced(df_res: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def baseline_score_no_model(last: pd.Series) -> float:
+    """
+    无模型时的基线打分：鼓励中短期动量、低波动、接近55日高、趋势成立
+    """
+    s = 0.0
+    mom = float(last.get("mom10") or 0.0)
+    vol = float(last.get("vol20") or 0.0)
+    trend = float(last.get("close", 0) > last.get("sma20", 1e9)) + float(last.get("sma20", 0) > last.get("sma60", 1e9))
+    near = float(last.get("near_high55") or 0.0)
+    macd = float(last.get("macd") or 0.0)
+    s += 0.8 * mom
+    s -= 0.15 * vol
+    s += 0.2 * (near - 0.9)
+    s += 0.05 * np.tanh(macd)
+    s += 0.1 * trend
+    return s
+
+
 def scan_market_and_rank(index_flag: str, start_date: str, end_date: str, adjustflag: str,
-                         weights_pack: Dict[str, Any], min_amt20: float = 2e8, topN: int = 30,
+                         weights_pack: Optional[Dict[str, Any]], min_amt20: float = 2e8, topN: int = 30,
                          logger=None,
                          codes_override: Optional[List[str]] = None,
                          skip_update: bool = False,
@@ -1038,7 +1159,7 @@ def scan_market_and_rank(index_flag: str, start_date: str, end_date: str, adjust
                          rsi_min: Optional[float] = None,
                          rsi_max: Optional[float] = None) -> pd.DataFrame:
     """
-    强化版扫描，支持：
+    强化版扫描（无权重也可运行）：
     - codes_override: 使用自定义股票池
     - skip_update: 跳过全量增量更新（快）
     - batch_size + sleep: ALL 扫描时控制接口压力
@@ -1060,7 +1181,7 @@ def scan_market_and_rank(index_flag: str, start_date: str, end_date: str, adjust
             logger("指数成分/自定义股票池为空")
         return pd.DataFrame()
 
-    if not skip_update:
+    if not skip_update and bs is not None:
         # 批量更新
         if len(codes) > batch_size and index_flag.upper() in ("ALL",):
             n = len(codes)
@@ -1076,11 +1197,12 @@ def scan_market_and_rank(index_flag: str, start_date: str, end_date: str, adjust
         if logger:
             logger("跳过行情增量更新（使用本地DB数据）")
 
-    feats = weights_pack["features"]
-    w = weights_pack["weights"]
-    b = weights_pack["intercept"]
-    mu = weights_pack["mu"]
-    sigma = weights_pack["sigma"]
+    # 模型参数（可能为空）
+    feats = weights_pack["features"] if weights_pack else None
+    w = weights_pack["weights"] if weights_pack else None
+    b = weights_pack["intercept"] if weights_pack else 0.0
+    mu = weights_pack["mu"] if weights_pack else None
+    sigma = weights_pack["sigma"] if weights_pack else None
 
     rows = []
     for idx, code in enumerate(codes):
@@ -1093,12 +1215,16 @@ def scan_market_and_rank(index_flag: str, start_date: str, end_date: str, adjust
             amt20 = float(last.get("amt20") or 0.0)
             if np.isnan(amt20) or amt20 < float(min_amt20):
                 continue
-            if any(f not in df.columns for f in feats):
-                continue
 
-            x = last[feats].astype(float).values
-            xz = standardize_apply(x, mu, sigma)
-            s = float(np.dot(xz, w) + b)
+            # 预测分：若无模型，使用基线分；若模型特征缺失，跳过预测分但仍可进入质量打分
+            s = np.nan
+            if feats and w is not None and sigma is not None:
+                if all(f in df.columns for f in feats):
+                    x = last[feats].astype(float).values
+                    xz = standardize_apply(x, mu, sigma)
+                    s = float(np.dot(xz, w) + b)
+            if not np.isfinite(s):
+                s = baseline_score_no_model(last)
 
             # 质量信号
             trend = _trend_flag(last)
@@ -1175,7 +1301,7 @@ def gen_extended_advice(row: pd.Series, risk_pct: float, capital: float) -> Tupl
     qty = int(max(0, math.floor(pos_amount / close / 100.0) * 100))
 
     advice = f"建议：{adv_type}；建议仓位≈{pos_pct * 100:.1f}%；止损≈{stop:.2f}；止盈≈{target:.2f}；建议数量≈{qty}股"
-    reason = f"扩展：预测分={score_val:.3f}；动量10日={mom10:.1%}；波动20日={float(row.get('vol20') or 0):.2f}；ATR14={atr14:.2f}"
+    reason = f"扩展：预测/基线分={score_val:.3f}；动量10日={mom10:.1%}；波动20日={float(row.get('vol20') or 0):.2f}；ATR14={atr14:.2f}"
     return advice, reason, pos_pct, stop, target, qty
 
 
@@ -1269,7 +1395,7 @@ def evaluate_quantile_performance(code: Optional[str] = None, limit: int = 1000,
     return out
 
 
-# =========================== GUI 应用 ===========================
+# =========================== 代码格式化工具 ===========================
 def normalize_code(code: str) -> Optional[str]:
     """
     归一化代码：
@@ -1309,15 +1435,135 @@ def parse_codes_from_text(text: str) -> List[str]:
     return sorted(list(set(out)))
 
 
+# =========================== 回测模块 ===========================
+def compute_metrics_from_curve(nav: pd.Series, period_days: int) -> Dict[str, float]:
+    if nav.empty:
+        return {"CAGR": np.nan, "MaxDD": np.nan, "Sharpe": np.nan, "WinRate": np.nan}
+    rets = nav.pct_change().dropna()
+    if rets.empty:
+        return {"CAGR": np.nan, "MaxDD": np.nan, "Sharpe": np.nan, "WinRate": np.nan}
+    total_days = len(nav)
+    cagr = float(nav.iloc[-1]) ** (252.0 / (total_days or 1)) - 1.0
+    peak = nav.cummax()
+    dd = (nav / peak - 1.0)
+    maxdd = float(dd.min())
+    mean_r = float(rets.mean()) * (252.0 / period_days)
+    std_r = float(rets.std(ddof=0)) * math.sqrt(252.0 / period_days)
+    sharpe = mean_r / (std_r + 1e-9)
+    win = float((rets > 0).mean())
+    return {"CAGR": cagr, "MaxDD": maxdd, "Sharpe": sharpe, "WinRate": win}
+
+
+def backtest_topN(weights_pack: Optional[Dict[str, Any]],
+                  codes: List[str], start_date: str, end_date: str,
+                  topN: int, hold_days: int, min_amt20: float = 2e8,
+                  fee_bps: float = 1.0, logger=None) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    简易回测：每 hold_days 调仓一次，按当日打分选 TopN 等权持有 hold_days
+    - 支持无模型（使用基线打分）
+    - 交易费率：单边 bps（如1=万分之一）
+    返回：交易期收益表 period_returns（date, ret），净值序列 nav（按调仓期）
+    """
+    if not codes:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+    # 预加载数据
+    feats = weights_pack["features"] if weights_pack else None
+    w = weights_pack["weights"] if weights_pack else None
+    b = weights_pack["intercept"] if weights_pack else 0.0
+    mu = weights_pack["mu"] if weights_pack else None
+    sigma = weights_pack["sigma"] if weights_pack else None
+
+    data_map: Dict[str, pd.DataFrame] = {}
+    for code in codes:
+        df = load_price_df(code, start_date=start_date, end_date=end_date)
+        if df.empty or len(df) < max(60, hold_days + 10):
+            continue
+        df = compute_indicators(df)
+        data_map[code] = df
+
+    if not data_map:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+    # 所有交易日（用交集或并集？用并集，然后每期以可交易样本为准）
+    all_dates = sorted(list(set(np.concatenate([df["date"].values for df in data_map.values()]))))
+    if len(all_dates) < hold_days + 2:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+    # 生成调仓日期序列（每 hold_days 一个）
+    rebalance_dates = all_dates[::hold_days]
+    # 确保有未来持有期
+    rebalance_dates = [d for d in rebalance_dates if (d in all_dates) and (all_dates.index(d) + hold_days < len(all_dates))]
+    if not rebalance_dates:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+    period_rets = []
+    for d in rebalance_dates:
+        # 这期的可选股票与打分
+        basket = []
+        for code, df in data_map.items():
+            if d not in list(df["date"]):
+                continue
+            row = df[df["date"] == d].iloc[0]
+            # 流动性过滤
+            amt20 = float(row.get("amt20") or 0.0)
+            if not np.isfinite(amt20) or amt20 < min_amt20:
+                continue
+            # 模型/基线打分
+            s = np.nan
+            if feats and w is not None and sigma is not None and all(f in df.columns for f in feats):
+                x = row[feats].astype(float).values
+                xz = standardize_apply(x, mu, sigma)
+                s = float(np.dot(xz, w) + b)
+            if not np.isfinite(s):
+                s = baseline_score_no_model(row)
+            basket.append((code, s))
+
+        if not basket:
+            continue
+        basket.sort(key=lambda x: x[1], reverse=True)
+        picks = [code for code, _ in basket[:max(1, topN)]]
+
+        # 期收益：未来 hold_days 的简单收盘收益，等权
+        rets = []
+        end_idx = all_dates.index(d) + hold_days
+        d1 = all_dates[end_idx]
+        for code in picks:
+            df = data_map[code]
+            # 找d和d1在该股的可用行
+            if d not in list(df["date"]) or d1 not in list(df["date"]):
+                continue
+            p0 = float(df[df["date"] == d]["close"].iloc[0])
+            p1 = float(df[df["date"] == d1]["close"].iloc[0])
+            r = p1 / p0 - 1.0
+            # 费用：进+出
+            fee = (fee_bps / 10000.0) * 2.0
+            r = r - fee
+            rets.append(r)
+        if not rets:
+            continue
+        period_rets.append((d1, float(np.mean(rets))))
+
+    if not period_rets:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+    pr = pd.DataFrame(period_rets, columns=["date", "ret"])
+    pr = pr.sort_values("date").reset_index(drop=True)
+    nav = (1.0 + pr["ret"]).cumprod()
+    nav.index = pd.to_datetime(pr["date"])
+    return pr, nav
+
+
+# =========================== GUI 应用 ===========================
 class EvoAdvisorApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("A股进化式投研助手 - Baostock（重构升级版）")
-        self.geometry("1360x900")
+        self.title("A股进化式投研助手 - Baostock（重构优化版，单文件GUI）")
+        self.geometry("1380x960")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # 变量
-        self.codes_var = tk.StringVar(value="sh.600000,sz.000001,sz.300750")
+        # 变量（去掉预设股票）
+        self.codes_var = tk.StringVar(value="")
         self.start_var = tk.StringVar(value="2015-01-01")
         self.end_var = tk.StringVar(value=dt.datetime.now().strftime(DATE_FMT))
         self.horizon_var = tk.IntVar(value=10)
@@ -1356,14 +1602,25 @@ class EvoAdvisorApp(tk.Tk):
         self.use_custom_for_train_var = tk.BooleanVar(value=False)
         self.use_custom_for_scan_var = tk.BooleanVar(value=False)
 
+        # 回测参数
+        self.bt_topN_var = tk.IntVar(value=20)
+        self.bt_hold_var = tk.IntVar(value=10)
+        self.bt_fee_bps_var = tk.DoubleVar(value=1.0)  # 单边bp
+        self.bt_min_amt20_var = tk.DoubleVar(value=2e8)
+
+        # 状态栏
+        self.status_var = tk.StringVar(value="就绪")
+
         self._build_ui()
 
         # baostock 登录
         try:
             bs_safe_login()
             self.log("baostock 登录成功")
+            self.set_status("baostock 登录成功")
         except Exception as e:
             self.log(f"[错误] {e}", error=True)
+            self.set_status("未登录 baostock（离线模式）")
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -1390,6 +1647,11 @@ class EvoAdvisorApp(tk.Tk):
         self.nb.add(self.page_scan, text="市场扫描")
         self._build_page_scan(self.page_scan)
 
+        # 页：回测
+        self.page_bt = ttk.Frame(self.nb)
+        self.nb.add(self.page_bt, text="回测")
+        self._build_page_backtest(self.page_bt)
+
         # 页：绩效/历史
         self.page_eval = ttk.Frame(self.nb)
         self.nb.add(self.page_eval, text="绩效 / 历史")
@@ -1400,9 +1662,14 @@ class EvoAdvisorApp(tk.Tk):
         self.nb.add(self.page_plot, text="图表")
         self._build_page_plot(self.page_plot)
 
+        # 页：用户操作
+        self.page_ops = ttk.Frame(self.nb)
+        self.nb.add(self.page_ops, text="用户操作")
+        self._build_page_ops(self.page_ops)
+
         # 页：操作说明
         self.page_help = ttk.Frame(self.nb)
-        self.nb.add(self.page_help, text="操作说明")
+        self.nb.add(self.page_help, text="使用说明")
         self._build_page_help(self.page_help)
 
         # 页：日志
@@ -1410,17 +1677,42 @@ class EvoAdvisorApp(tk.Tk):
         self.nb.add(self.page_log, text="日志")
         self._build_page_log(self.page_log)
 
+        # 状态栏
+        status_bar = ttk.Frame(self, padding=4)
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        ttk.Label(status_bar, textvariable=self.status_var, foreground="green").pack(side=tk.LEFT)
+
+    def _add_tree_with_scroll(self, parent, columns, height=12, widths: Optional[Dict[str, int]] = None):
+        """
+        创建带垂直滚动条的Treeview
+        """
+        frame = ttk.Frame(parent)
+        tree = ttk.Treeview(frame, columns=columns, show="headings", height=height)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        # 设置列
+        for c in columns:
+            tree.heading(c, text=c)
+            if widths:
+                tree.column(c, width=widths.get(c, 100), anchor=tk.W)
+        return frame, tree
+
     def _build_page_data(self, parent):
         frm = ttk.LabelFrame(parent, text="股票池与数据更新", padding=8)
         frm.pack(fill=tk.X, padx=8, pady=6)
         ttk.Label(frm, text="股票代码(逗号/换行分隔)").grid(row=0, column=0, sticky="e")
         ttk.Entry(frm, textvariable=self.codes_var, width=80).grid(row=0, column=1, columnspan=4, sticky="we", padx=6)
         ttk.Button(frm, text="导入股票列表文件", command=self.on_import_codes).grid(row=0, column=5, padx=6, sticky="w")
-        ttk.Label(frm, text="自定义池状态:").grid(row=0, column=6, sticky="e")
-        ttk.Label(frm, textvariable=self.custom_count_var, foreground="blue").grid(row=0, column=7, sticky="w")
+        ttk.Button(frm, text="从指数填充（HS300）", command=self.fill_codes_from_index_hs300).grid(row=0, column=6, padx=6, sticky="w")
+        ttk.Label(frm, text="自定义池状态:").grid(row=0, column=7, sticky="e")
+        ttk.Label(frm, textvariable=self.custom_count_var, foreground="blue").grid(row=0, column=8, sticky="w")
 
-        ttk.Checkbutton(frm, text="训练使用自定义股票池", variable=self.use_custom_for_train_var).grid(row=1, column=1, sticky="w")
-        ttk.Checkbutton(frm, text="扫描使用自定义股票池", variable=self.use_custom_for_scan_var).grid(row=1, column=2, sticky="w")
+        ttk.Checkbutton(frm, text="训练用自定义池", variable=self.use_custom_for_train_var).grid(row=1, column=1, sticky="w")
+        ttk.Checkbutton(frm, text="扫描用自定义池", variable=self.use_custom_for_scan_var).grid(row=1, column=2, sticky="w")
 
         ttk.Label(frm, text="起始日期").grid(row=2, column=0, sticky="e")
         ttk.Entry(frm, textvariable=self.start_var, width=12).grid(row=2, column=1, sticky="w")
@@ -1433,7 +1725,7 @@ class EvoAdvisorApp(tk.Tk):
         btns.pack(fill=tk.X)
         self.btn_update = ttk.Button(btns, text="增量更新数据（按输入框/自定义池）", command=self.on_update_data_async)
         self.btn_update.pack(side=tk.LEFT, padx=6)
-        ttk.Label(btns, text="说明：增量拉取baostock数据并写入SQLite").pack(side=tk.LEFT, padx=8)
+        ttk.Label(btns, text="说明：增量拉取baostock数据并写入SQLite；离线模式将仅使用本地数据").pack(side=tk.LEFT, padx=8)
 
     def _build_page_train(self, parent):
         frm = ttk.LabelFrame(parent, text="训练配置", padding=8)
@@ -1463,11 +1755,10 @@ class EvoAdvisorApp(tk.Tk):
         self.pb.pack(side=tk.LEFT, padx=8)
 
         # 结果表
-        self.train_tree = ttk.Treeview(parent, columns=("timestamp","horizon","method","lambda","ic","icir","mse","n_days"), show="headings", height=8)
-        for c, w in [("timestamp",160),("horizon",70),("method",110),("lambda",90),("ic",80),("icir",80),("mse",120),("n_days",80)]:
-            self.train_tree.heading(c, text=c)
-            self.train_tree.column(c, width=w, anchor=tk.W)
-        self.train_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        cols = ("timestamp","horizon","method","lambda","ic","icir","mse","n_days")
+        frame, self.train_tree = self._add_tree_with_scroll(parent, columns=cols, height=8,
+                                                            widths={"timestamp":160,"horizon":70,"method":110,"lambda":90,"ic":80,"icir":80,"mse":120,"n_days":80})
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
     def _build_page_adv(self, parent):
         top = ttk.LabelFrame(parent, text="参数", padding=8)
@@ -1482,13 +1773,10 @@ class EvoAdvisorApp(tk.Tk):
         self.btn_adv = ttk.Button(top, text="生成扩展建议并保存", command=self.on_advise_async)
         self.btn_adv.grid(row=0, column=7, padx=8)
 
-        cols = ("date", "code", "score", "advice", "reasoning", "horizon")
-        self.adv_tree = ttk.Treeview(parent, columns=cols, show="headings", height=12)
-        for c in cols:
-            self.adv_tree.heading(c, text=c)
-            width = 120 if c in ("date", "code", "horizon") else (80 if c == "score" else 840 if c == "reasoning" else 140)
-            self.adv_tree.column(c, width=width, anchor=tk.W)
-        self.adv_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        cols = ("date", "code", "name", "score", "advice", "reasoning", "horizon")
+        frame, self.adv_tree = self._add_tree_with_scroll(parent, columns=cols, height=12,
+                                                          widths={"date":100, "code":90, "name":120, "score":80, "advice":240, "reasoning":840, "horizon":80})
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
     def _build_page_scan(self, parent):
         frm = ttk.LabelFrame(parent, text="扫描参数", padding=8)
@@ -1529,25 +1817,49 @@ class EvoAdvisorApp(tk.Tk):
 
         btns = ttk.Frame(parent, padding=8)
         btns.pack(fill=tk.X)
-        self.btn_scan = ttk.Button(btns, text="开始市场扫描", command=self.on_scan_market_async)
+        self.btn_scan = ttk.Button(btns, text="开始市场扫描（无权重也可用）", command=self.on_scan_market_async)
         self.btn_scan.pack(side=tk.LEFT, padx=6)
         self.btn_export_scan = ttk.Button(btns, text="导出结果CSV", command=self.export_scan_csv, state=tk.DISABLED)
         self.btn_export_scan.pack(side=tk.LEFT, padx=6)
 
-        cols = ["date", "code", "close", "score", "qscore", "mom10", "vol20", "atr14", "amt20",
+        cols = ["date", "code", "name", "close", "score", "qscore", "mom10", "vol20", "atr14", "amt20",
                 "trend", "breakout55", "dd60",
                 "pos_pct", "stop", "target", "qty", "advice", "reasoning"]
-        self.scan_tree = ttk.Treeview(parent, columns=cols, show="headings", height=16)
         widths = {
-            "date": 90, "code": 90, "close": 80, "score": 70, "qscore": 70, "mom10": 80, "vol20": 80,
+            "date": 90, "code": 90, "name": 120, "close": 80, "score": 70, "qscore": 70, "mom10": 80, "vol20": 80,
             "atr14": 80, "amt20": 120, "trend": 70, "breakout55": 90, "dd60": 80,
             "pos_pct": 80, "stop": 90, "target": 90, "qty": 80, "advice": 240, "reasoning": 520
         }
-        for c in cols:
-            self.scan_tree.heading(c, text=c)
-            self.scan_tree.column(c, width=widths.get(c, 100), anchor=tk.W)
-        self.scan_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        frame, self.scan_tree = self._add_tree_with_scroll(parent, columns=cols, height=18, widths=widths)
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
         self.scan_df_cache: Optional[pd.DataFrame] = None
+
+    def _build_page_backtest(self, parent):
+        frm = ttk.LabelFrame(parent, text="回测参数", padding=8)
+        frm.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Label(frm, text="TopN").grid(row=0, column=0, sticky="e")
+        ttk.Entry(frm, textvariable=self.bt_topN_var, width=8).grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(frm, text="持有H(日)").grid(row=0, column=2, sticky="e")
+        ttk.Entry(frm, textvariable=self.bt_hold_var, width=8).grid(row=0, column=3, sticky="w", padx=4)
+        ttk.Label(frm, text="单边费率(bps)").grid(row=0, column=4, sticky="e")
+        ttk.Entry(frm, textvariable=self.bt_fee_bps_var, width=8).grid(row=0, column=5, sticky="w", padx=4)
+        ttk.Label(frm, text="近20日均额≥").grid(row=0, column=6, sticky="e")
+        ttk.Entry(frm, textvariable=self.bt_min_amt20_var, width=14).grid(row=0, column=7, sticky="w", padx=4)
+
+        btns = ttk.Frame(parent, padding=8)
+        btns.pack(fill=tk.X)
+        self.btn_bt = ttk.Button(btns, text="开始回测（可无权重）", command=self.on_backtest_async)
+        self.btn_bt.pack(side=tk.LEFT, padx=6)
+
+        cols = ("date", "ret")
+        frame, self.bt_tree = self._add_tree_with_scroll(parent, columns=cols, height=10,
+                                                         widths={"date":120, "ret":120})
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+
+        frm_m = ttk.Frame(parent, padding=6)
+        frm_m.pack(fill=tk.X)
+        self.bt_metrics_var = tk.StringVar(value="暂无结果")
+        ttk.Label(frm_m, textvariable=self.bt_metrics_var, foreground="purple").pack(side=tk.LEFT)
 
     def _build_page_eval(self, parent):
         frm = ttk.LabelFrame(parent, text="筛选与操作", padding=8)
@@ -1572,66 +1884,101 @@ class EvoAdvisorApp(tk.Tk):
         ttk.Button(btns, text="分位统计（按score分组）", command=self.on_quant_stats).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="绘制收益分布图", command=self.on_plot_ret_hist).pack(side=tk.LEFT, padx=6)
 
-        self.eval_tree = ttk.Treeview(parent, columns=("type","n","avg_ret","win_rate"), show="headings", height=8)
-        for c in ("type", "n", "avg_ret", "win_rate"):
-            self.eval_tree.heading(c, text=c)
-            self.eval_tree.column(c, width=140 if c == "type" else 120, anchor=tk.CENTER)
-        self.eval_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        frame1, self.eval_tree = self._add_tree_with_scroll(parent, columns=("type","n","avg_ret","win_rate"), height=8,
+                                                            widths={"type":140,"n":120,"avg_ret":120,"win_rate":120})
+        frame1.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
-        self.quant_tree = ttk.Treeview(parent, columns=("quantile","n","avg_ret","win_rate"), show="headings", height=6)
-        for c in ("quantile", "n", "avg_ret", "win_rate"):
-            self.quant_tree.heading(c, text=c)
-            self.quant_tree.column(c, width=120, anchor=tk.CENTER)
-        self.quant_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        frame2, self.quant_tree = self._add_tree_with_scroll(parent, columns=("quantile","n","avg_ret","win_rate"), height=6,
+                                                             widths={"quantile":120,"n":120,"avg_ret":120,"win_rate":120})
+        frame2.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
     def _build_page_plot(self, parent):
         btns = ttk.Frame(parent, padding=8)
         btns.pack(fill=tk.X)
         ttk.Button(btns, text="绘图（若自选表有选中则绘该股，否则取输入框首个）", command=self.on_plot).pack(side=tk.LEFT, padx=6)
 
+    def _build_page_ops(self, parent):
+        frm = ttk.LabelFrame(parent, text="记录每日操作（买/卖/调仓）", padding=8)
+        frm.pack(fill=tk.X, padx=8, pady=6)
+        self.op_code_var = tk.StringVar(value="")
+        self.op_action_var = tk.StringVar(value="BUY")
+        self.op_date_var = tk.StringVar(value=dt.datetime.now().strftime(DATE_FMT))
+        self.op_price_var = tk.DoubleVar(value=0.0)
+        self.op_qty_var = tk.IntVar(value=0)
+        self.op_note_var = tk.StringVar(value="")
+        ttk.Label(frm, text="代码").grid(row=0, column=0, sticky="e")
+        ttk.Entry(frm, textvariable=self.op_code_var, width=12).grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(frm, text="动作").grid(row=0, column=2, sticky="e")
+        ttk.Combobox(frm, textvariable=self.op_action_var, values=["BUY","SELL","ADJ"], width=8, state="readonly").grid(row=0, column=3, sticky="w")
+        ttk.Label(frm, text="日期").grid(row=0, column=4, sticky="e")
+        ttk.Entry(frm, textvariable=self.op_date_var, width=12).grid(row=0, column=5, sticky="w", padx=4)
+        ttk.Label(frm, text="价格").grid(row=0, column=6, sticky="e")
+        ttk.Entry(frm, textvariable=self.op_price_var, width=10).grid(row=0, column=7, sticky="w", padx=4)
+        ttk.Label(frm, text="数量").grid(row=0, column=8, sticky="e")
+        ttk.Entry(frm, textvariable=self.op_qty_var, width=10).grid(row=0, column=9, sticky="w", padx=4)
+        ttk.Label(frm, text="备注").grid(row=0, column=10, sticky="e")
+        ttk.Entry(frm, textvariable=self.op_note_var, width=24).grid(row=0, column=11, sticky="w", padx=4)
+        ttk.Button(frm, text="保存操作", command=self.on_save_op).grid(row=0, column=12, padx=6)
+
+        frame, self.op_tree = self._add_tree_with_scroll(parent,
+                                                         columns=("date","code","name","action","price","qty","note"),
+                                                         height=10,
+                                                         widths={"date":100,"code":90,"name":120,"action":80,"price":100,"qty":100,"note":480})
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        ttk.Button(parent, text="刷新操作记录", command=self.refresh_ops).pack(pady=4)
+
     def _build_page_help(self, parent):
         text = tk.Text(parent, wrap="word")
-        text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        help_msg = """
-使用说明（要点）：
-1. 股票池管理
-   - 输入框支持逗号/换行分隔，如：sh.600000, sz.000001
-   - “导入股票列表文件”支持 .txt/.csv：
-       * .txt：每行一个代码，支持 600000 或 sh.600000 或 600000.SH
-       * .csv：默认读取首列，如存在名为 code 的列优先
-   - “训练/扫描使用自定义股票池”可勾选使用刚导入的池
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=vsb.set)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y, padx=4)
+        help_msg = """  
+使用说明（快速上手）：  
+1. 股票池管理  
+   - 在“数据/股票池”页输入股票代码（支持 600000 / sh.600000 / 600000.SH），逗号或换行分隔  
+   - 可“导入股票列表文件”（.txt 每行一个；.csv 默认首列或名为 code 的列）  
+   - 也可“从指数填充（HS300）”快速获取股票池；勾选“训练/扫描用自定义池”使用该集合  
 
-2. 数据更新
-   - 填好“起始/结束日期”“复权方式”，点击“增量更新数据”
-   - 仅会从本地已有最新日期+1开始增量拉取，写入SQLite
+2. 数据更新  
+   - 填好“起始/结束日期”“复权方式”，点击“增量更新数据”  
+   - 已有数据只从最新日期+1拉取增量，保存到本地SQLite（advisor.db）  
+   - 若baostock未安装或未登录，也可离线使用本地数据  
 
-3. 训练/进化
-   - 选择 horizon（H日）、训练模式（ridge_cv/ga）、目标指标（IC/MSE）
-   - ridge_cv：时间序列CV选择λ；ga：进化搜索特征子集+λ（更慢但更强）
-   - 完成后会保存最新权重，并在表格显示IC/ICIR/MSE等评估
+3. 训练/进化  
+   - 设置 horizon（H日）、训练模式（ridge_cv/ga）、目标指标（IC/MSE）  
+   - ridge_cv：时间序列CV自动选λ；ga：进化搜索特征子集+λ（更强但更慢）  
+   - 训练完成自动保存权重，并展示IC/ICIR/MSE等评估；自选建议/扫描/回测将自动使用最新权重  
 
-4. 自选建议
-   - 在“自选建议”页填写/填充股票列表（可从自定义池填充）
-   - 设置资金与风险参数，点击“生成扩展建议并保存”
-   - 结果会写入历史 advice 表中
+4. 自选建议  
+   - 在“自选建议”页粘贴/填充股票列表，设置资金与风险参数，点击“生成扩展建议并保存”  
+   - 将写入历史 advice 表；建议包含仓位、止损、止盈、建议数量等；无权重时也能基于“基线打分”生成建议  
 
-5. 市场扫描（优质股挑选）
-   - 指数支持：HS300/ZZ500/SZ50/ALL/CUSTOM
-   - 可勾选“扫描前跳过增量更新（快）”，适合ALL扫描时使用本地数据
-   - 高级筛选：趋势/接近55日高/波动Z阈值/RSI区间
-   - 组合质量分 qscore = 预测Z分/动量Z分/波动Z分/趋势/突破/回撤综合
-   - 扫描结果可导出CSV
+5. 市场扫描  
+   - 指数支持 HS300/ZZ500/SZ50/ALL/CUSTOM；也可勾选“扫描用自定义池”  
+   - 可勾选“跳过增量更新（快）”，在ALL大范围扫描时建议先离线用本地数据  
+   - 高级筛选：趋势/接近55日高/波动Z阈值/RSI区间/流动性阈值  
+   - 结果支持导出CSV；无权重时将使用“基线打分”也能得到排序结果  
 
-6. 绩效/历史
-   - 支持按日期/类型筛选评估，并可导出历史
-   - 分位统计：按score分组查看收益与胜率
-   - 收益分布图：快速查看分布形态
+6. 回测  
+   - 设置 TopN、持有H日、费率、流动性阈值，点击“开始回测”  
+   - 回测按每H日等权调仓TopN；输出期收益表、净值曲线与指标（年化、回撤、Sharpe、胜率）  
+   - 若无权重则使用“基线打分”进行回测  
 
-常见问题：
-- baostock 未安装/登录失败：请 pip install baostock，重启程序
-- ALL 扫描很慢：建议勾选“跳过增量更新”，并适当调大“近20日均额阈值”
-- 代码格式：支持 600000 / sh.600000 / 600000.SH，自动归一化
-- 免责声明：仅用于研究，不构成投资建议
+7. 绩效/历史  
+   - 可按“日期范围、类型（ALL/BUY/SELL）、H(日)”筛选评估历史建议的表现  
+   - 支持分位统计、收益分布图、导出历史  
+
+8. 用户操作（连续化进化）  
+   - 记录每日操作（买/卖/调仓），保存到本地，自动显示列表  
+   - 系统会计算已知的盈亏与风险提示（为后续个性化进化、挖掘习惯提供数据基础）  
+
+常见问题：  
+- baostock 未安装/登录失败：请先 pip install baostock，再重启程序  
+- ALL 扫描很慢：建议勾选“跳过增量更新”，并适当调大“近20日均额阈值”  
+- 代码格式：支持 600000 / sh.600000 / 600000.SH，自动归一化  
+- 名称显示：自动从baostock缓存到SQLite；也可导入指数后缓存  
+- 免责声明：仅用于研究，不构成投资建议  
 """
         text.insert(tk.END, help_msg)
         text.configure(state="disabled")
@@ -1640,7 +1987,10 @@ class EvoAdvisorApp(tk.Tk):
         frm = ttk.Frame(parent, padding=6)
         frm.pack(fill=tk.BOTH, expand=True)
         self.log_text = tk.Text(frm, height=16)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        vsb = ttk.Scrollbar(frm, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=vsb.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
     # ---------- 工具 ----------
     def parse_codes(self) -> List[str]:
@@ -1654,23 +2004,38 @@ class EvoAdvisorApp(tk.Tk):
         self.log_text.see(tk.END)
         self.update_idletasks()
 
-    def _set_busy(self, busy: bool):
+    def set_status(self, text: str):
+        self.status_var.set(text)
+        self.update_idletasks()
+
+    def beep(self):
+        try:
+            self.bell()
+        except Exception:
+            pass
+
+    def _set_busy(self, busy: bool, doing: str = ""):
         try:
             if busy:
                 self.pb.start(80)
+                if doing:
+                    self.set_status(doing + " ...")
             else:
                 self.pb.stop()
+                self.set_status("就绪")
         except Exception:
             pass
-        for btn in [getattr(self, n, None) for n in ["btn_update","btn_train","btn_adv","btn_scan","btn_export_scan"]]:
+        for name in ["btn_update","btn_train","btn_adv","btn_scan","btn_export_scan","btn_bt"]:
+            btn = getattr(self, name, None)
             if btn is None:
                 continue
             try:
-                btn.configure(state=tk.DISABLED if busy and n != "btn_export_scan" else tk.NORMAL)
+                btn.configure(state=tk.DISABLED if busy and name != "btn_export_scan" else tk.NORMAL)
             except Exception:
                 pass
+        self.update_idletasks()
 
-    # ---------- 文件导入 ----------
+    # ---------- 文件/指数填充 ----------
     def on_import_codes(self):
         path = filedialog.askopenfilename(
             title="选择股票代码文件（.txt/.csv）",
@@ -1688,7 +2053,7 @@ class EvoAdvisorApp(tk.Tk):
                 df = pd.read_csv(path, nrows=100000)
                 col = None
                 for c in df.columns:
-                    if c.lower().strip() in ("code", "证券代码", "ts_code", "wind_code"):
+                    if str(c).lower().strip() in ("code", "证券代码", "ts_code", "wind_code"):
                         col = c
                         break
                 if col is None:
@@ -1707,7 +2072,6 @@ class EvoAdvisorApp(tk.Tk):
             self.custom_codes_path = path
             self.custom_count_var.set(f"{len(codes)}个 | {os.path.basename(path)}")
             if codes:
-                # 顺便填入输入框，便于立即使用
                 self.codes_var.set(", ".join(codes[:50]) + (" ..." if len(codes) > 50 else ""))
                 self.log(f"已导入自定义股票池 {len(codes)} 个")
             else:
@@ -1722,13 +2086,27 @@ class EvoAdvisorApp(tk.Tk):
             return
         self.codes_var.set(", ".join(self.custom_codes[:200]) + (" ..." if len(self.custom_codes) > 200 else ""))
 
+    def fill_codes_from_index_hs300(self):
+        try:
+            if bs is None:
+                messagebox.showinfo("提示", "未安装baostock，无法从指数获取。")
+                return
+            codes = get_market_codes("HS300", self.end_var.get().strip())
+            self.custom_codes = codes
+            self.custom_count_var.set(f"{len(codes)}个 | HS300")
+            self.codes_var.set(", ".join(codes[:200]) + (" ..." if len(codes) > 200 else ""))
+            self.log(f"已从HS300填充股票池 {len(codes)} 个")
+        except Exception as e:
+            self.log(f"HS300填充失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
+
     # ---------- 事件（异步包装） ----------
     def on_update_data_async(self):
         t = threading.Thread(target=self._update_data_worker, daemon=True)
         t.start()
 
     def _update_data_worker(self):
-        self._set_busy(True)
+        self._set_busy(True, "更新数据")
         try:
             codes = self.custom_codes if self.use_custom_for_train_var.get() and self.custom_codes else self.parse_codes()
             if not codes:
@@ -1738,8 +2116,12 @@ class EvoAdvisorApp(tk.Tk):
             end_date = self.end_var.get().strip()
             adj = self.adjustflag_var.get().strip()
             self.log(f"开始增量更新，标的数={len(codes)}，区间={start_date}~{end_date}，复权={adj}")
-            update_data_for_codes(codes, start_date, end_date, adj, logger=self.log)
+            if bs is None:
+                self.log("未安装baostock，跳过远端拉取，仅使用本地数据", error=True)
+            else:
+                update_data_for_codes(codes, start_date, end_date, adj, logger=self.log)
             self.log("数据更新完成")
+            self.beep()
         except Exception as e:
             self.log(f"更新失败: {e}", error=True)
             messagebox.showerror("错误", str(e))
@@ -1751,7 +2133,7 @@ class EvoAdvisorApp(tk.Tk):
         t.start()
 
     def _train_worker(self):
-        self._set_busy(True)
+        self._set_busy(True, "训练模型")
         try:
             codes = self.custom_codes if self.use_custom_for_train_var.get() and self.custom_codes else self.parse_codes()
             if not codes:
@@ -1794,6 +2176,7 @@ class EvoAdvisorApp(tk.Tk):
             )
             self.train_tree.insert("", tk.END, values=vals)
             messagebox.showinfo("完成", f"训练完成，权重时间戳：{pack['timestamp']}")
+            self.beep()
         except Exception as e:
             self.log(f"训练失败: {e}", error=True)
             messagebox.showerror("错误", str(e))
@@ -1805,13 +2188,13 @@ class EvoAdvisorApp(tk.Tk):
         t.start()
 
     def _advise_worker(self):
-        self._set_busy(True)
+        self._set_busy(True, "生成建议")
         try:
             codes = self.parse_codes()
-            w = load_latest_weights()
-            if not w:
-                messagebox.showwarning("提示", "尚未训练权重，请先训练。")
+            if not codes:
+                messagebox.showwarning("提示", "请输入股票代码（或在数据页导入/填充）")
                 return
+            w = load_latest_weights()  # 可空
             start_date = self.start_var.get().strip()
             capital = float(self.capital_var.get())
             risk_pct = float(self.risk_pct_var.get())
@@ -1820,19 +2203,31 @@ class EvoAdvisorApp(tk.Tk):
                 self.adv_tree.delete(i)
 
             adv_records = []
-            feats = w["features"]; ww = w["weights"]; bb = w["intercept"]; mu = w["mu"]; sigma = w["sigma"]
+            # 如果没有权重，仍然可生成基线建议
+            feats = w["features"] if w else None
+            ww = w["weights"] if w else None
+            bb = w["intercept"] if w else 0.0
+            mu = w["mu"] if w else None
+            sigma = w["sigma"] if w else None
             pos_thr = 0.02; neg_thr = -0.02
+            name_map = get_name_map(codes)
+
             for code in codes:
                 df = load_price_df(code, start_date=start_date)
                 if df.empty:
                     continue
                 df = compute_indicators(df)
-                if df.empty or any(f not in df.columns for f in feats):
+                if df.empty:
                     continue
                 last = df.iloc[-1]
-                x = last[feats].astype(float).values
-                xz = standardize_apply(x, mu, sigma)
-                s = float(np.dot(xz, ww) + bb)
+                # 预测/基线分
+                s = np.nan
+                if feats and ww is not None and sigma is not None and all(f in df.columns for f in feats):
+                    x = last[feats].astype(float).values
+                    xz = standardize_apply(x, mu, sigma)
+                    s = float(np.dot(xz, ww) + bb)
+                if not np.isfinite(s):
+                    s = baseline_score_no_model(last)
                 base_adv = score_to_advice(s, pos_thr, neg_thr)
                 base_reason = reasoning_from_signals(last)
                 row = pd.Series({
@@ -1845,13 +2240,15 @@ class EvoAdvisorApp(tk.Tk):
                 ext_text, ext_reason, pos_pct, stop, target, qty = gen_extended_advice(row, risk_pct=risk_pct, capital=capital)
                 advice_text = ext_text
                 reasoning = f"[{base_adv}] {base_reason} | {ext_reason}"
-                self.adv_tree.insert("", tk.END, values=(last["date"], code, f"{s:.4f}", advice_text, reasoning, w["horizon"]))
-                adv_records.append((str(last["date"]), code, float(s), advice_text, reasoning, int(w["horizon"])))
+                name = name_map.get(code) or get_stock_name(code)
+                self.adv_tree.insert("", tk.END, values=(last["date"], code, name, f"{s:.4f}", advice_text, reasoning, (w["horizon"] if w else int(self.horizon_var.get()))))
+                adv_records.append((str(last["date"]), code, float(s), advice_text, reasoning, int(w["horizon"] if w else self.horizon_var.get())))
             if adv_records:
                 insert_advice(adv_records)
                 self.log(f"生成建议 {len(adv_records)} 条，并已持久化")
             else:
                 self.log("未生成任何建议（可能数据为空或特征缺失）")
+            self.beep()
         except Exception as e:
             self.log(f"生成建议失败: {e}", error=True)
             messagebox.showerror("错误", str(e))
@@ -1863,12 +2260,9 @@ class EvoAdvisorApp(tk.Tk):
         t.start()
 
     def _scan_worker(self):
-        self._set_busy(True)
+        self._set_busy(True, "市场扫描")
         try:
-            w = load_latest_weights()
-            if not w:
-                messagebox.showwarning("提示", "尚未训练权重，请先用你的股票池训练一次。")
-                return
+            w = load_latest_weights()  # 允许为空
             index_flag = self.index_flag_var.get().strip()
             start_date = self.start_var.get().strip()
             end_date = self.end_var.get().strip()
@@ -1916,13 +2310,17 @@ class EvoAdvisorApp(tk.Tk):
 
             records = []
             ext_rows = []
+            codes = df["code"].tolist()
+            name_map = get_name_map(codes)
+
             for _, r in df.iterrows():
                 ext_text, ext_reason, pos_pct, stop, target, qty = gen_extended_advice(r, risk_pct=risk_pct, capital=capital)
                 advice_text = ext_text
                 reasoning = f"[质量分={r['qscore']:.3f}] {ext_reason}"
-                records.append((r["date"], r["code"], float(r["score"]), advice_text, reasoning, int(w["horizon"])))
+                records.append((r["date"], r["code"], float(r["score"]), advice_text, reasoning, int(w["horizon"] if w else self.horizon_var.get())))
                 ext_rows.append({
-                    "date": r["date"], "code": r["code"], "close": r["close"], "score": r["score"], "qscore": r["qscore"],
+                    "date": r["date"], "code": r["code"], "name": name_map.get(r["code"]) or get_stock_name(r["code"]),
+                    "close": r["close"], "score": r["score"], "qscore": r["qscore"],
                     "mom10": r["mom10"], "vol20": r["vol20"], "atr14": r["atr14"], "amt20": r["amt20"],
                     "trend": r.get("trend", 0.0), "breakout55": r.get("breakout55", 0.0), "dd60": r.get("dd60", 0.0),
                     "pos_pct": pos_pct, "stop": stop, "target": target, "qty": qty, "advice": advice_text, "reasoning": reasoning
@@ -1936,14 +2334,15 @@ class EvoAdvisorApp(tk.Tk):
 
             for _, r in df_ext.iterrows():
                 self.scan_tree.insert("", tk.END, values=(
-                    r["date"], r["code"], f"{r['close']:.2f}",
+                    r["date"], r["code"], r.get("name",""), f"{r['close']:.2f}",
                     f"{r['score']:.4f}", f"{r['qscore']:.4f}",
                     f"{r['mom10']:.2%}", f"{r['vol20']:.3f}",
                     f"{r['atr14']:.3f}", f"{r['amt20']:.0f}",
                     f"{r.get('trend',0):.0f}", f"{r.get('breakout55',0):.0f}", f"{r.get('dd60',0):.2%}",
                     f"{r['pos_pct'] * 100:.1f}%", f"{r['stop']:.2f}", f"{r['target']:.2f}", int(r["qty"]),
-                    r["advice"], r["reasoning"]
+                    r["advice"], r["reasoning"],                     r["advice"], r["reasoning"]
                 ))
+            self.beep()
         except Exception as e:
             self.log(f"市场扫描失败: {e}", error=True)
             messagebox.showerror("错误", str(e))
@@ -1952,203 +2351,360 @@ class EvoAdvisorApp(tk.Tk):
 
     def export_scan_csv(self):
         if self.scan_df_cache is None or self.scan_df_cache.empty:
-            messagebox.showinfo("提示", "暂无扫描结果")
+            messagebox.showinfo("提示", "没有可导出的扫描结果")
             return
-        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
-                                            initialfile=f"scan_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        path = filedialog.asksaveasfilename(
+            title="导出扫描结果为CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")]
+        )
         if not path:
             return
         try:
-            self.scan_df_cache.to_csv(path, index=False, encoding="utf-8-sig")
-            messagebox.showinfo("导出成功", f"已导出到：\n{path}")
+            df = self.scan_df_cache.copy()
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+            self.log(f"扫描结果已导出：{path}")
+            messagebox.showinfo("完成", f"已导出：{path}")
         except Exception as e:
-            messagebox.showerror("错误", f"导出失败：{e}")
+            self.log(f"导出失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
+
+    # ---------- 回测 ----------
+    def on_backtest_async(self):
+        t = threading.Thread(target=self._backtest_worker, daemon=True)
+        t.start()
+
+    def _backtest_worker(self):
+        self._set_busy(True, "回测中")
+        try:
+            # 股票池优先级：自定义池 > 输入框 > HS300
+            codes = []
+            if self.custom_codes:
+                codes = self.custom_codes
+                self.log(f"回测使用自定义股票池，数量={len(codes)}")
+            else:
+                codes = self.parse_codes()
+                if codes:
+                    self.log(f"回测使用输入框股票池，数量={len(codes)}")
+            if not codes:
+                if bs is not None:
+                    codes = get_market_codes("HS300", self.end_var.get().strip())
+                    self.log(f"未提供股票池，使用HS300，数量={len(codes)}")
+                else:
+                    messagebox.showwarning("提示", "请先输入或导入股票池（离线模式无法从指数获取）")
+                    return
+
+            w = load_latest_weights()  # 可为空 -> 使用基线打分
+            start_date = self.start_var.get().strip()
+            end_date = self.end_var.get().strip()
+            topN = int(self.bt_topN_var.get())
+            hold_days = int(self.bt_hold_var.get())
+            fee_bps = float(self.bt_fee_bps_var.get())
+            min_amt20 = float(self.bt_min_amt20_var.get())
+
+            self.log(f"开始回测：Top{topN}, H={hold_days}, 费率={fee_bps}bps, 均额≥{min_amt20:.0f}")
+            pr, nav = backtest_topN(
+                w, codes, start_date, end_date,
+                topN=topN, hold_days=hold_days, min_amt20=min_amt20, fee_bps=fee_bps, logger=self.log
+            )
+            for i in self.bt_tree.get_children():
+                self.bt_tree.delete(i)
+            if pr.empty:
+                self.bt_metrics_var.set("无有效回测期（可能数据不足或过滤条件过严）")
+                messagebox.showinfo("提示", "无有效回测结果")
+                return
+
+            for _, r in pr.iterrows():
+                self.bt_tree.insert("", tk.END, values=(r["date"], f"{float(r['ret']):.3%}"))
+
+            metrics = compute_metrics_from_curve(nav, period_days=hold_days)
+            text = f"CAGR={metrics['CAGR']:.2%} | MaxDD={metrics['MaxDD']:.2%} | Sharpe={metrics['Sharpe']:.2f} | 胜率={metrics['WinRate']:.2%}"
+            self.bt_metrics_var.set(text)
+            self.log(f"回测完成：{text}")
+
+            # 绘制净值曲线（弹窗）
+            try:
+                fig, ax = plt.subplots(figsize=(8.6, 4.2))
+                nav.plot(ax=ax, color="blue", lw=1.5)
+                ax.set_title("回测净值曲线")
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.show()
+            except Exception:
+                pass
+
+            self.beep()
+        except Exception as e:
+            self.log(f"回测失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
+        finally:
+            self._set_busy(False)
+
+    # ---------- 绩效/历史 ----------
+    def _get_selected_code_from_any(self) -> Optional[str]:
+        # 优先取扫描表，其次自选建议表
+        try:
+            sel = self.scan_tree.selection()
+            if sel:
+                vals = self.scan_tree.item(sel[0], "values")
+                return normalize_code(vals[1]) if vals and len(vals) > 1 else None
+        except Exception:
+            pass
+        try:
+            sel = self.adv_tree.selection()
+            if sel:
+                vals = self.adv_tree.item(sel[0], "values")
+                return normalize_code(vals[1]) if vals and len(vals) > 1 else None
+        except Exception:
+            pass
+        return None
 
     def on_evaluate(self):
-        code = None
-        sel = self.adv_tree.selection()
-        if sel:
-            vals = self.adv_tree.item(sel[0], "values")
-            if len(vals) >= 2:
-                code = vals[1]
-        start_date = self.eval_start_var.get().strip() or None
-        end_date = self.eval_end_var.get().strip() or None
-        type_choice = self.eval_type_var.get().strip().upper()
-        type_filter = None if type_choice == "ALL" else type_choice
-        hz = self.eval_hz_var.get().strip()
-        horizon = int(hz) if hz else None
-
-        df = evaluate_history_performance(code=code, limit=1000, start_date=start_date, end_date=end_date,
-                                          type_filter=type_filter, horizon=horizon)
-        for i in self.eval_tree.get_children():
-            self.eval_tree.delete(i)
-        if df is None or df.empty:
-            messagebox.showinfo("提示", "历史建议不足或无法计算收益")
-            return
-        for _, r in df.iterrows():
-            self.eval_tree.insert("", tk.END, values=(r["type"], int(r["n"]), f"{float(r['avg_ret']):.2%}", f"{float(r['win_rate']):.1%}"))
+        try:
+            code = self._get_selected_code_from_any()
+            start_date = self.eval_start_var.get().strip() or None
+            end_date = self.eval_end_var.get().strip() or None
+            typ = self.eval_type_var.get().strip().upper()
+            if typ == "ALL":
+                typ = None
+            hz_txt = self.eval_hz_var.get().strip()
+            horizon = int(hz_txt) if hz_txt else None
+            df = evaluate_history_performance(code=code, start_date=start_date, end_date=end_date,
+                                              type_filter=typ, horizon=horizon)
+            for i in self.eval_tree.get_children():
+                self.eval_tree.delete(i)
+            if df is None or df.empty:
+                messagebox.showinfo("提示", "无可评估的历史建议")
+                return
+            for _, r in df.iterrows():
+                self.eval_tree.insert("", tk.END, values=(
+                    r["type"], int(r["n"]), f"{float(r['avg_ret']):.3%}", f"{float(r['win_rate']):.2%}"
+                ))
+            self.log("历史建议绩效评估完成")
+        except Exception as e:
+            self.log(f"评估失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
 
     def on_view_history(self):
-        code = None
-        sel = self.adv_tree.selection()
-        if sel:
-            vals = self.adv_tree.item(sel[0], "values")
-            if len(vals) >= 2:
-                code = vals[1]
-        start_date = self.eval_start_var.get().strip() or None
-        end_date = self.eval_end_var.get().strip() or None
-        type_choice = self.eval_type_var.get().strip().upper()
-        type_filter = None if type_choice == "ALL" else type_choice
-
-        rows = query_advice(code=code, limit=2000, start_date=start_date, end_date=end_date, type_filter=type_filter)
-        if not rows:
-            messagebox.showinfo("提示", "暂无历史建议")
-            return
-        win = tk.Toplevel(self)
-        win.title("建议历史" + (f" - {code}" if code else ""))
-        tree = ttk.Treeview(win, columns=("date", "code", "score", "advice", "reasoning", "horizon"), show="headings")
-        for c in ("date", "code", "score", "advice", "reasoning", "horizon"):
-            tree.heading(c, text=c)
-            width = 120 if c in ("date", "code", "horizon") else (80 if c == "score" else 720 if c == "reasoning" else 140)
-            tree.column(c, width=width, anchor=tk.W)
-        tree.pack(fill=tk.BOTH, expand=True)
-
-        for r in rows:
-            date, code_, score, adv, reason, hz = r
-            tree.insert("", tk.END, values=(date, code_, f"{score:.4f}", adv, reason, hz))
-
-        def do_export():
-            path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
-                                                initialfile=f"advice_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-            if not path:
+        try:
+            code = self._get_selected_code_from_any()
+            start_date = self.eval_start_var.get().strip() or None
+            end_date = self.eval_end_var.get().strip() or None
+            typ = self.eval_type_var.get().strip().upper()
+            if typ == "ALL":
+                typ = None
+            rows = query_advice(code=code, limit=2000, start_date=start_date, end_date=end_date, type_filter=typ)
+            if not rows:
+                messagebox.showinfo("提示", "无历史建议记录")
                 return
-            try:
-                df = pd.DataFrame(rows, columns=["date", "code", "score", "advice", "reasoning", "horizon"])
+            win = tk.Toplevel(self)
+            win.title("历史建议记录")
+            cols = ("date","code","name","score","advice","reasoning","horizon")
+            frame = ttk.Frame(win, padding=6)
+            frame.pack(fill=tk.BOTH, expand=True)
+            tree = ttk.Treeview(frame, columns=cols, show="headings", height=18)
+            vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+            tree.configure(yscrollcommand=vsb.set)
+            tree.grid(row=0, column=0, sticky="nsew")
+            vsb.grid(row=0, column=1, sticky="ns")
+            frame.rowconfigure(0, weight=1)
+            frame.columnconfigure(0, weight=1)
+            widths = {"date":100,"code":100,"name":120,"score":80,"advice":260,"reasoning":800,"horizon":80}
+            for c in cols:
+                tree.heading(c, text=c)
+                tree.column(c, width=widths.get(c, 120), anchor=tk.W)
+            codes = list(sorted(set([r[1] for r in rows])))
+            name_map = get_name_map(codes)
+            for date, code_, score, advice, reasoning, hz in rows:
+                tree.insert("", tk.END, values=(date, code_, name_map.get(code_) or get_stock_name(code_),
+                                                f"{float(score):.4f}", advice, reasoning, int(hz)))
+            def _export():
+                path = filedialog.asksaveasfilename(
+                    title="导出历史建议为CSV",
+                    defaultextension=".csv",
+                    filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")]
+                )
+                if not path:
+                    return
+                df = pd.DataFrame(rows, columns=["date","code","score","advice","reasoning","horizon"])
+                df["name"] = df["code"].map(lambda x: name_map.get(x) or get_stock_name(x))
+                df = df[["date","code","name","score","advice","reasoning","horizon"]]
                 df.to_csv(path, index=False, encoding="utf-8-sig")
-                messagebox.showinfo("导出成功", f"已导出到：\n{path}")
-            except Exception as e:
-                messagebox.showerror("错误", f"导出失败：{e}")
-
-        ttk.Button(win, text="导出CSV", command=do_export).pack(pady=6)
+                messagebox.showinfo("完成", f"已导出：{path}")
+            ttk.Button(win, text="导出CSV", command=_export).pack(pady=4)
+        except Exception as e:
+            self.log(f"查看历史失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
 
     def on_quant_stats(self):
-        code = None
-        sel = self.adv_tree.selection()
-        if sel:
-            vals = self.adv_tree.item(sel[0], "values")
-            if len(vals) >= 2:
-                code = vals[1]
-        start_date = self.eval_start_var.get().strip() or None
-        end_date = self.eval_end_var.get().strip() or None
-        hz = self.eval_hz_var.get().strip()
-        horizon = int(hz) if hz else None
-        df = evaluate_quantile_performance(code=code, limit=2000, start_date=start_date, end_date=end_date, horizon=horizon, q=5)
-        for i in self.quant_tree.get_children():
-            self.quant_tree.delete(i)
-        if df is None or df.empty:
-            messagebox.showinfo("提示", "数据不足，无法分位统计")
-            return
-        for _, r in df.iterrows():
-            self.quant_tree.insert("", tk.END, values=(int(r["quantile"]), int(r["n"]), f"{float(r['avg_ret']):.2%}", f"{float(r['win_rate']):.1%}"))
+        try:
+            code = self._get_selected_code_from_any()
+            start_date = self.eval_start_var.get().strip() or None
+            end_date = self.eval_end_var.get().strip() or None
+            hz_txt = self.eval_hz_var.get().strip()
+            horizon = int(hz_txt) if hz_txt else None
+            df = evaluate_quantile_performance(code=code, start_date=start_date, end_date=end_date, horizon=horizon, q=5)
+            for i in self.quant_tree.get_children():
+                self.quant_tree.delete(i)
+            if df is None or df.empty:
+                messagebox.showinfo("提示", "无分位统计数据")
+                return
+            for _, r in df.iterrows():
+                self.quant_tree.insert("", tk.END, values=(
+                    int(r["quantile"]), int(r["n"]), f"{float(r['avg_ret']):.3%}", f"{float(r['win_rate']):.2%}"
+                ))
+            self.log("分位统计完成")
+        except Exception as e:
+            self.log(f"分位统计失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
 
     def on_plot_ret_hist(self):
-        # 绘制历史建议的收益分布图（按筛选条件）
-        code = None
-        sel = self.adv_tree.selection()
-        if sel:
-            vals = self.adv_tree.item(sel[0], "values")
-            if len(vals) >= 2:
-                code = vals[1]
-        start_date = self.eval_start_var.get().strip() or None
-        end_date = self.eval_end_var.get().strip() or None
-        type_choice = self.eval_type_var.get().strip().upper()
-        type_filter = None if type_choice == "ALL" else type_choice
-        hz = self.eval_hz_var.get().strip()
-        horizon = int(hz) if hz else None
-
-        rows = query_advice(code=code, limit=2000, start_date=start_date, end_date=end_date, type_filter=type_filter)
-        if not rows:
-            messagebox.showinfo("提示", "暂无历史建议")
-            return
-        rets = []
-        for date, code_, score, advice, reasoning, hz0 in rows:
-            hz_use = horizon if horizon is not None else int(hz0)
-            r = _find_future_return(code_, date, hz_use)
-            if r is None:
-                continue
-            typ = _parse_basic_advice(advice or "")
-            signed = r if typ in ("买入", "强烈买入") else (-r if typ in ("卖出", "强烈卖出") else 0.0)
-            rets.append(signed)
-        if not rets:
-            messagebox.showinfo("提示", "无法计算收益分布")
-            return
-        plt.figure(figsize=(8, 5))
-        plt.hist(rets, bins=40, color="steelblue", alpha=0.85)
-        plt.title("历史建议收益分布（签名后）")
-        plt.xlabel("收益")
-        plt.ylabel("频数")
-        plt.grid(True, linestyle="--", alpha=0.3)
-        plt.show()
-
-    def on_plot(self):
-        code = None
-        sel = self.adv_tree.selection()
-        if sel:
-            vals = self.adv_tree.item(sel[0], "values")
-            if len(vals) >= 2:
-                code = vals[1]
-        if not code:
-            codes = self.parse_codes()
-            if not codes:
-                messagebox.showwarning("提示", "未指定股票代码")
+        try:
+            code = self._get_selected_code_from_any()
+            start_date = self.eval_start_var.get().strip() or None
+            end_date = self.eval_end_var.get().strip() or None
+            hz_txt = self.eval_hz_var.get().strip()
+            horizon = int(hz_txt) if hz_txt else None
+            rows = query_advice(code=code, limit=2000, start_date=start_date, end_date=end_date, type_filter=None)
+            if not rows:
+                messagebox.showinfo("提示", "无历史建议记录")
                 return
-            code = codes[0]
-        df = load_price_df(code)
-        if df.empty or len(df) < 30:
-            messagebox.showwarning("提示", f"{code} 数据不足无法绘图")
-            return
-        df = compute_indicators(df)
-        self._plot_matplotlib(code, df)
+            vals = []
+            for date, code_, score, advice, reasoning, hz in rows:
+                hz_use = int(horizon) if horizon is not None else int(hz)
+                ret = _find_future_return(code_, date, hz_use)
+                if ret is None:
+                    continue
+                typ = _parse_basic_advice(advice or "")
+                signed_ret = ret if typ in ("买入", "强烈买入") else (-ret if typ in ("卖出","强烈卖出") else 0.0)
+                vals.append(signed_ret)
+            if not vals:
+                messagebox.showinfo("提示", "无可绘制的收益数据")
+                return
+            plt.figure(figsize=(7.6,4.2))
+            plt.hist(vals, bins=40, color="#4c72b0", alpha=0.85)
+            plt.title("签名收益分布（历史建议）")
+            plt.xlabel("收益")
+            plt.ylabel("频数")
+            plt.grid(True, alpha=0.25)
+            plt.tight_layout()
+            plt.show()
+        except Exception as e:
+            self.log(f"绘图失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
 
-    def _plot_matplotlib(self, code: str, df: pd.DataFrame):
-        fig, ax = plt.subplots(5, 1, figsize=(11.5, 9), sharex=True, gridspec_kw={"height_ratios": [3, 1.2, 1.2, 1, 0.8]})
-        t = pd.to_datetime(df["date"])
-        # 价格+均线+布林带
-        ax[0].plot(t, df["close"], label="Close", color="black", linewidth=1)
-        ax[0].plot(t, df["sma20"], label="SMA20", color="blue", linewidth=1)
-        ax[0].plot(t, df["sma60"], label="SMA60", color="orange", linewidth=1)
-        ax[0].plot(t, df["bb_up"], label="BBup", color="gray", alpha=0.5, linewidth=0.8)
-        ax[0].plot(t, df["bb_low"], label="BBlow", color="gray", alpha=0.5, linewidth=0.8)
-        ax[0].set_title(f"{code} 收盘价/均线/布林带")
-        ax[0].legend(loc="upper left")
-        ax[0].grid(True, linestyle="--", alpha=0.3)
-        # MACD
-        macd_vals = df["macd"].fillna(0).values
-        colors = ["red" if x > 0 else "green" for x in macd_vals]
-        ax[1].bar(t, macd_vals, label="MACD", color=colors)
-        ax[1].plot(t, df["dif"], label="DIF", color="purple")
-        ax[1].plot(t, df["dea"], label="DEA", color="brown")
-        ax[1].legend(loc="upper left")
-        ax[1].grid(True, linestyle="--", alpha=0.3)
-        # KDJ
-        ax[2].plot(t, df["kdj_k"], label="K", color="blue")
-        ax[2].plot(t, df["kdj_d"], label="D", color="orange")
-        ax[2].plot(t, df["kdj_j"], label="J", color="green")
-        ax[2].legend(loc="upper left")
-        ax[2].grid(True, linestyle="--", alpha=0.3)
-        # ATR
-        ax[3].plot(t, df["atr14"], label="ATR14", color="teal")
-        ax[3].legend(loc="upper left")
-        ax[3].grid(True, linestyle="--", alpha=0.3)
-        # 趋势/突破/回撤（辅助线）
-        ax[4].plot(t, df["near_high55"], label="近55日高比", color="darkorange")
-        ax[4].plot(t, df["dd60"], label="60日回撤", color="crimson")
-        ax[4].legend(loc="upper left")
-        ax[4].grid(True, linestyle="--", alpha=0.3)
-        fig.autofmt_xdate()
-        plt.tight_layout()
-        plt.show()
+    # ---------- 图表 ----------
+    def on_plot(self):
+        try:
+            code = self._get_selected_code_from_any()
+            if not code:
+                codes = self.parse_codes()
+                if not codes:
+                    messagebox.showwarning("提示", "无可绘制的股票代码")
+                    return
+                code = codes[0]
+            start_date = self.start_var.get().strip()
+            end_date = self.end_var.get().strip()
+            df = load_price_df(code, start_date=start_date, end_date=end_date)
+            if df.empty:
+                messagebox.showinfo("提示", "该区间无数据")
+                return
+            df = compute_indicators(df)
+            name = get_stock_name(code) or code
 
+            # 画3子图：价格+SMA/BOLL，MACD，RSI
+            fig = plt.figure(figsize=(9.6, 6.8))
+            gs = fig.add_gridspec(3, 1, height_ratios=[3, 1.5, 1.2], hspace=0.1)
+
+            ax1 = fig.add_subplot(gs[0, 0])
+            ax1.plot(pd.to_datetime(df["date"]), df["close"], label="Close", color="#333333")
+            ax1.plot(pd.to_datetime(df["date"]), df["sma20"], label="SMA20", color="#1f77b4")
+            ax1.plot(pd.to_datetime(df["date"]), df["sma60"], label="SMA60", color="#ff7f0e")
+            ax1.fill_between(pd.to_datetime(df["date"]), df["bb_low"], df["bb_up"], color="#1f77b4", alpha=0.08, label="BOLL")
+            ax1.set_title(f"{name} ({code})")
+            ax1.grid(True, alpha=0.3)
+            ax1.legend(loc="upper left")
+
+            ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
+            ax2.plot(pd.to_datetime(df["date"]), df["macd"], label="MACD", color="#2ca02c")
+            ax2.plot(pd.to_datetime(df["date"]), df["dif"], label="DIF", color="#d62728", alpha=0.8)
+            ax2.plot(pd.to_datetime(df["date"]), df["dea"], label="DEA", color="#9467bd", alpha=0.8)
+            ax2.grid(True, alpha=0.25)
+            ax2.legend(loc="upper left")
+
+            ax3 = fig.add_subplot(gs[2, 0], sharex=ax1)
+            ax3.plot(pd.to_datetime(df["date"]), df["rsi14"], label="RSI14", color="#8c564b")
+            ax3.axhline(30, color="red", lw=0.8, ls="--", alpha=0.6)
+            ax3.axhline(70, color="green", lw=0.8, ls="--", alpha=0.6)
+            ax3.grid(True, alpha=0.25)
+            ax3.legend(loc="upper left")
+
+            plt.setp(ax1.get_xticklabels(), visible=False)
+            plt.setp(ax2.get_xticklabels(), visible=False)
+
+            plt.tight_layout()
+            plt.show()
+        except Exception as e:
+            self.log(f"绘图失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
+
+    # ---------- 用户操作 ----------
+    def refresh_ops(self):
+        try:
+            for i in self.op_tree.get_children():
+                self.op_tree.delete(i)
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("SELECT date, code, action, price, qty, note FROM user_ops ORDER BY date DESC, id DESC LIMIT 1000")
+            rows = c.fetchall()
+            conn.close()
+            codes = list(sorted(set([r[1] for r in rows])))
+            name_map = get_name_map(codes)
+            for d, code, act, price, qty, note in rows:
+                self.op_tree.insert("", tk.END, values=(
+                    d, code, name_map.get(code) or get_stock_name(code), act, f"{safe_float(price):.3f}", int(qty or 0), note or ""
+                ))
+            self.log("操作记录已刷新")
+        except Exception as e:
+            self.log(f"刷新操作记录失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
+
+    def on_save_op(self):
+        try:
+            code_raw = self.op_code_var.get().strip()
+            code = normalize_code(code_raw) if code_raw else None
+            if not code:
+                messagebox.showwarning("提示", "请输入有效的股票代码")
+                return
+            date = self.op_date_var.get().strip()
+            # 简单校验日期
+            try:
+                dt.datetime.strptime(date, DATE_FMT)
+            except Exception:
+                messagebox.showwarning("提示", "日期格式应为 YYYY-MM-DD")
+                return
+            act = self.op_action_var.get().strip().upper()
+            if act not in ("BUY","SELL","ADJ"):
+                messagebox.showwarning("提示", "动作仅支持 BUY/SELL/ADJ")
+                return
+            price = float(self.op_price_var.get() or 0.0)
+            qty = int(self.op_qty_var.get() or 0)
+            note = self.op_note_var.get().strip()
+
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("INSERT INTO user_ops(date, code, action, price, qty, note) VALUES(?,?,?,?,?,?)",
+                      (date, code, act, price, qty, note))
+            conn.commit()
+            conn.close()
+            fetch_and_cache_name(code)
+            self.refresh_ops()
+            messagebox.showinfo("完成", "操作已保存")
+        except Exception as e:
+            self.log(f"保存操作失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
+
+    # ---------- 关闭 ----------
     def on_close(self):
         try:
             bs_safe_logout()
@@ -2157,12 +2713,9 @@ class EvoAdvisorApp(tk.Tk):
         self.destroy()
 
 
-# =========================== 入口 ===========================
-def main():
+# =========================== 启动入口 ===========================
+if __name__ == "__main__":
     init_db()
     app = EvoAdvisorApp()
+    app.refresh_ops()
     app.mainloop()
-
-
-if __name__ == "__main__":
-    main()
