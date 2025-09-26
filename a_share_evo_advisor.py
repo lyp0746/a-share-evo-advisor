@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股“进化式”投研助手（重构优化版，单文件 GUI）
+A股“进化式”投研助手（商业化优化版，单文件 GUI）
 - 数据源：baostock
 - 增量下载：仅拉取新增交易日
 - 量化特征：SMA/EMA/MACD/RSI/ATR/BOLL/KDJ/CCI/WR/OBV/MFI/CMF/BBP/Range/Gap/动量等
@@ -9,15 +9,15 @@ A股“进化式”投研助手（重构优化版，单文件 GUI）
     * 遗传算法（特征子集+正则λ，目标最大化验证Rank IC）
 - 市场扫描：
     * 支持 HS300/ZZ500/SZ50/ALL/CUSTOM
-    * 无权重时自动使用“基线打分”也可扫描（不再依赖训练）
+    * 无权重时自动使用“基线打分”也可扫描（不依赖训练）
     * 高级筛选：趋势/接近55日高/波动Z阈值/RSI区间/流动性阈值
 - 扩展建议：结合预测、动量、波动、ATR给出仓位/止损/止盈/数量
-- 回测：TopN选股 + H日持有 + 交易费率，输出年化/回撤/Sharpe/胜率，绘制净值曲线
-- 绩效评估：按日期/类型筛选、导出CSV、分位统计、分布图
-- 用户操作：记录每日操作（买/卖/调仓），计算盈亏，给出风险提示（连续化进化的基础数据）
+- 回测：TopN选股 + H日持有 + 交易费率，输出年化/回撤/Sharpe/胜率，并绘制净值曲线
+- 绩效评估：按日期/类型筛选、导出CSV、分位统计、收益分布图
+- 用户操作：记录每日操作（买/卖/调仓），为连续化进化提供数据基础
 - 持久化：SQLite（价格、名称、建议、权重、元信息、用户操作）
-- GUI：tkinter + matplotlib + Notebook 分页 + 异步线程 + 进度条 + 滚动条
-- 低门槛：去掉预设股票，支持股票名称展示，增加“从指数填充”“从文件导入”，丰富使用说明
+- GUI：tkinter + matplotlib + Notebook 分页 + 异步线程 + 进度条 + 滚动条 + 菜单栏 + 主题切换
+- 可中止大任务（Stop），参数自动持久化，日志写文件，权重导出/导入
 
 依赖:
     pip install baostock pandas numpy matplotlib
@@ -34,16 +34,17 @@ import re
 import sqlite3
 import threading
 import time
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Callable
 
 import matplotlib
 import numpy as np
 import pandas as pd
 
+# 使用 TkAgg 后端用于嵌入式窗口
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 
-# 中文字体
+# 中文字体兼容
 plt.rcParams["font.family"] = ["SimHei", "WenQuanYi Micro Hei", "Heiti TC", "sans-serif"]
 plt.rcParams["axes.unicode_minus"] = False
 
@@ -55,14 +56,18 @@ try:
 except ImportError:
     bs = None
 
+# =========================== 全局常量与状态 ===========================
+APP_NAME = "A股进化式投研助手"
+APP_VERSION = "1.3.0"
 DB_PATH = "advisor.db"
 DATE_FMT = "%Y-%m-%d"
+CONFIG_PATH = "advisor_config.json"
+LOG_PATH = "advisor.log"
 
-# =========================== 全局状态 ===========================
 app_state: Dict[str, Any] = {"horizon": 10}
 
 
-# =========================== 工具函数 ===========================
+# =========================== 通用工具函数 ===========================
 def safe_float(x, default=np.nan):
     try:
         return float(x)
@@ -142,73 +147,73 @@ def get_conn():
 def init_db():
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""  
-              CREATE TABLE IF NOT EXISTS prices  
-              (  
-                  code   TEXT NOT NULL,  
-                  date   TEXT NOT NULL,  
-                  open   REAL,  
-                  high   REAL,  
-                  low    REAL,  
-                  close  REAL,  
-                  volume REAL,  
-                  amount REAL,  
-                  PRIMARY KEY (code, date)  
-              )  
+    c.execute("""
+              CREATE TABLE IF NOT EXISTS prices
+              (
+                  code   TEXT NOT NULL,
+                  date   TEXT NOT NULL,
+                  open   REAL,
+                  high   REAL,
+                  low    REAL,
+                  close  REAL,
+                  volume REAL,
+                  amount REAL,
+                  PRIMARY KEY (code, date)
+              )
               """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(date)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_prices_code ON prices(code)")
-    c.execute("""  
-              CREATE TABLE IF NOT EXISTS advice  
-              (  
-                  id        INTEGER PRIMARY KEY AUTOINCREMENT,  
-                  date      TEXT NOT NULL,  
-                  code      TEXT NOT NULL,  
-                  score     REAL,  
-                  advice    TEXT,  
-                  reasoning TEXT,  
-                  horizon   INTEGER  
-              )  
+    c.execute("""
+              CREATE TABLE IF NOT EXISTS advice
+              (
+                  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                  date      TEXT NOT NULL,
+                  code      TEXT NOT NULL,
+                  score     REAL,
+                  advice    TEXT,
+                  reasoning TEXT,
+                  horizon   INTEGER
+              )
               """)
-    c.execute("""  
-              CREATE TABLE IF NOT EXISTS weights  
-              (  
-                  timestamp TEXT PRIMARY KEY,  
-                  horizon   INTEGER,  
-                  features  TEXT,  
-                  weights   TEXT,  
-                  intercept REAL,  
-                  mu        TEXT,  
-                  sigma     TEXT,  
-                  lambda    REAL,  
-                  notes     TEXT  
-              )  
+    c.execute("""
+              CREATE TABLE IF NOT EXISTS weights
+              (
+                  timestamp TEXT PRIMARY KEY,
+                  horizon   INTEGER,
+                  features  TEXT,
+                  weights   TEXT,
+                  intercept REAL,
+                  mu        TEXT,
+                  sigma     TEXT,
+                  lambda    REAL,
+                  notes     TEXT
+              )
               """)
-    c.execute("""  
-              CREATE TABLE IF NOT EXISTS meta  
-              (  
-                  key TEXT PRIMARY KEY,  
-                  value TEXT  
-              )  
+    c.execute("""
+              CREATE TABLE IF NOT EXISTS meta
+              (
+                  key TEXT PRIMARY KEY,
+                  value TEXT
+              )
               """)
-    c.execute("""  
-              CREATE TABLE IF NOT EXISTS stock_names  
-              (  
-                  code TEXT PRIMARY KEY,  
-                  name TEXT  
-              )  
+    c.execute("""
+              CREATE TABLE IF NOT EXISTS stock_names
+              (
+                  code TEXT PRIMARY KEY,
+                  name TEXT
+              )
               """)
-    c.execute("""  
-              CREATE TABLE IF NOT EXISTS user_ops  
-              (  
-                  id        INTEGER PRIMARY KEY AUTOINCREMENT,  
-                  date      TEXT NOT NULL,  
-                  code      TEXT NOT NULL,  
-                  action    TEXT NOT NULL,   -- BUY/SELL/ADJ  
-                  price     REAL,  
-                  qty       INTEGER,  
-                  note      TEXT  
-              )  
+    c.execute("""
+              CREATE TABLE IF NOT EXISTS user_ops
+              (
+                  id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                  date   TEXT NOT NULL,
+                  code   TEXT NOT NULL,
+                  action TEXT NOT NULL, -- BUY/SELL/ADJ  
+                  price  REAL,
+                  qty    INTEGER,
+                  note   TEXT
+              )
               """)
     conn.commit()
     conn.close()
@@ -247,28 +252,28 @@ def load_price_df(code: str, start_date: Optional[str] = None, end_date: Optiona
     conn = get_conn()
     c = conn.cursor()
     if start_date and end_date:
-        c.execute("""  
-                  SELECT date, open, high, low, close, volume, amount  
-                  FROM prices  
-                  WHERE code = ?  
-                    AND date >= ?  
-                    AND date <= ?  
-                  ORDER BY date ASC  
+        c.execute("""
+                  SELECT date, open, high, low, close, volume, amount
+                  FROM prices
+                  WHERE code = ?
+                    AND date >= ?
+                    AND date <= ?
+                  ORDER BY date ASC
                   """, (code, start_date, end_date))
     elif start_date:
-        c.execute("""  
-                  SELECT date, open, high, low, close, volume, amount  
-                  FROM prices  
-                  WHERE code = ?  
-                    AND date >= ?  
-                  ORDER BY date ASC  
+        c.execute("""
+                  SELECT date, open, high, low, close, volume, amount
+                  FROM prices
+                  WHERE code = ?
+                    AND date >= ?
+                  ORDER BY date ASC
                   """, (code, start_date))
     else:
-        c.execute("""  
-                  SELECT date, open, high, low, close, volume, amount  
-                  FROM prices  
-                  WHERE code = ?  
-                  ORDER BY date ASC  
+        c.execute("""
+                  SELECT date, open, high, low, close, volume, amount
+                  FROM prices
+                  WHERE code = ?
+                  ORDER BY date ASC
                   """, (code,))
     rows = c.fetchall()
     conn.close()
@@ -285,9 +290,9 @@ def insert_advice(records: List[Tuple[str, str, float, str, str, int]]):
         return
     conn = get_conn()
     c = conn.cursor()
-    c.executemany("""  
-                  INSERT INTO advice (date, code, score, advice, reasoning, horizon)  
-                  VALUES (?, ?, ?, ?, ?, ?)  
+    c.executemany("""
+                  INSERT INTO advice (date, code, score, advice, reasoning, horizon)
+                  VALUES (?, ?, ?, ?, ?, ?)
                   """, records)
     conn.commit()
     conn.close()
@@ -301,11 +306,11 @@ def query_advice(code: Optional[str] = None, limit: int = 200,
     """
     conn = get_conn()
     c = conn.cursor()
-    sql = """  
-        SELECT date, code, score, advice, reasoning, horizon  
-        FROM advice  
-        WHERE 1=1  
-    """
+    sql = """
+          SELECT date, code, score, advice, reasoning, horizon
+          FROM advice
+          WHERE 1 = 1 \
+          """
     params: List[Any] = []
     if code:
         sql += " AND code=?"
@@ -338,7 +343,7 @@ def save_weights_record(horizon: int, features: List[str], weights: np.ndarray, 
         INSERT OR REPLACE INTO weights (timestamp, horizon, features, weights, intercept, mu, sigma, lambda, notes)  
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)  
     """, (
-        ts, int(horizon), json.dumps(features), json.dumps(list(map(float, weights))),
+        ts, int(horizon), json.dumps(features, ensure_ascii=False), json.dumps(list(map(float, weights))),
         float(intercept), json.dumps(list(map(float, mu))), json.dumps(list(map(float, sigma))),
         float(lam), notes or ""
     ))
@@ -357,9 +362,18 @@ def load_latest_weights() -> Optional[Dict[str, Any]]:
         conn.close()
         return None
     ts = row[0]
-    c.execute("""  
-              SELECT timestamp, horizon, features, weights, intercept, mu, sigma, lambda, notes  
-              FROM weights WHERE timestamp = ?  
+    c.execute("""
+              SELECT timestamp,
+                     horizon,
+                     features,
+                     weights,
+                     intercept,
+                     mu,
+                     sigma,
+                     lambda,
+                     notes
+              FROM weights
+              WHERE timestamp = ?
               """, (ts,))
     w = c.fetchone()
     conn.close()
@@ -553,8 +567,8 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     low_min = df["low"].rolling(9).min()
     high_max = df["high"].rolling(9).max()
     rsv = (df["close"] - low_min) / (high_max - low_min + 1e-9) * 100
-    df["kdj_k"] = rsv.ewm(alpha=1/3, adjust=False).mean()
-    df["kdj_d"] = df["kdj_k"].ewm(alpha=1/3, adjust=False).mean()
+    df["kdj_k"] = rsv.ewm(alpha=1 / 3, adjust=False).mean()
+    df["kdj_d"] = df["kdj_k"].ewm(alpha=1 / 3, adjust=False).mean()
     df["kdj_j"] = 3 * df["kdj_k"] - 2 * df["kdj_d"]
 
     # CCI(14)
@@ -895,8 +909,10 @@ def evolve_ga_feature_selection(Xdf: pd.DataFrame, y: pd.Series, n_pop: int = 24
         folds = ts_cv_splits(dates, n_folds=n_folds)
         scores = []
         for tr_idx, va_idx in folds:
-            Xtr = Xs[tr_idx]; ytr = y.values[tr_idx]
-            Xva = Xs[va_idx]; yva = y.values[va_idx]
+            Xtr = Xs[tr_idx];
+            ytr = y.values[tr_idx]
+            Xva = Xs[va_idx];
+            yva = y.values[va_idx]
             w, b = ridge_regression(Xtr, ytr, lam=lam)
             pred = Xva @ w + b
             ic_mean, _, _ = groupby_date_ic(pd.Series(pred), pd.Series(yva), pd.Series(dates[va_idx]))
@@ -1034,7 +1050,8 @@ def get_market_codes(index_flag: str, on_date: str) -> List[str]:
             code = row[1]
             name = row[2] if len(row) > 2 else ""
             if code and (code.startswith("sh.") or code.startswith("sz.")):
-                codes.append(code); names.append(name)
+                codes.append(code);
+                names.append(name)
     elif index_flag == "ZZ500":
         rs = bs.query_zz500_stocks(date=on_date)
         while rs.error_code == '0' and rs.next():
@@ -1042,7 +1059,8 @@ def get_market_codes(index_flag: str, on_date: str) -> List[str]:
             code = row[1]
             name = row[2] if len(row) > 2 else ""
             if code and (code.startswith("sh.") or code.startswith("sz.")):
-                codes.append(code); names.append(name)
+                codes.append(code);
+                names.append(name)
     elif index_flag == "SZ50":
         rs = bs.query_sz50_stocks(date=on_date)
         while rs.error_code == '0' and rs.next():
@@ -1050,7 +1068,8 @@ def get_market_codes(index_flag: str, on_date: str) -> List[str]:
             code = row[1]
             name = row[2] if len(row) > 2 else ""
             if code and (code.startswith("sh.") or code.startswith("sz.")):
-                codes.append(code); names.append(name)
+                codes.append(code);
+                names.append(name)
     else:
         rs = bs.query_all_stock(day=on_date)
         while rs.error_code == '0' and rs.next():
@@ -1068,8 +1087,18 @@ def get_market_codes(index_flag: str, on_date: str) -> List[str]:
     return codes
 
 
-def update_data_for_codes(codes: List[str], start_date: str, end_date: str, adjustflag: str, logger=None):
+def update_data_for_codes(codes: List[str], start_date: str, end_date: str, adjustflag: str,
+                          logger: Optional[Callable[[str], None]] = None,
+                          stop_cb: Optional[Callable[[], bool]] = None):
+    if bs is None:
+        if logger:
+            logger("未安装baostock，跳过远端拉取，仅使用本地数据")
+        return
     for i, code in enumerate(codes):
+        if stop_cb and stop_cb():
+            if logger:
+                logger("任务已被用户中止")
+            break
         try:
             if logger:
                 logger(f"更新 {code} ({i + 1}/{len(codes)}) ...")
@@ -1157,13 +1186,15 @@ def scan_market_and_rank(index_flag: str, start_date: str, end_date: str, adjust
                          require_breakout: bool = False,
                          max_vol_z: Optional[float] = None,
                          rsi_min: Optional[float] = None,
-                         rsi_max: Optional[float] = None) -> pd.DataFrame:
+                         rsi_max: Optional[float] = None,
+                         stop_cb: Optional[Callable[[], bool]] = None) -> pd.DataFrame:
     """
     强化版扫描（无权重也可运行）：
     - codes_override: 使用自定义股票池
     - skip_update: 跳过全量增量更新（快）
     - batch_size + sleep: ALL 扫描时控制接口压力
     - 高级筛选：趋势/突破/最大波动z阈值/RSI区间
+    - stop_cb: 可选的中止回调
     """
     scan_date = end_date
     try:
@@ -1186,13 +1217,17 @@ def scan_market_and_rank(index_flag: str, start_date: str, end_date: str, adjust
         if len(codes) > batch_size and index_flag.upper() in ("ALL",):
             n = len(codes)
             for i in range(0, n, batch_size):
+                if stop_cb and stop_cb():
+                    if logger:
+                        logger("任务已被用户中止")
+                    break
                 part = codes[i:i + batch_size]
                 if logger:
-                    logger(f"批次更新 {i//batch_size + 1}/{math.ceil(n/batch_size)}，数量={len(part)}")
-                update_data_for_codes(part, start_date, end_date, adjustflag, logger=logger)
+                    logger(f"批次更新 {i // batch_size + 1}/{math.ceil(n / batch_size)}，数量={len(part)}")
+                update_data_for_codes(part, start_date, end_date, adjustflag, logger=logger, stop_cb=stop_cb)
                 time.sleep(max(0, sleep_ms_between_batches) / 1000.0)
         else:
-            update_data_for_codes(codes, start_date, end_date, adjustflag, logger=logger)
+            update_data_for_codes(codes, start_date, end_date, adjustflag, logger=logger, stop_cb=stop_cb)
     else:
         if logger:
             logger("跳过行情增量更新（使用本地DB数据）")
@@ -1206,6 +1241,10 @@ def scan_market_and_rank(index_flag: str, start_date: str, end_date: str, adjust
 
     rows = []
     for idx, code in enumerate(codes):
+        if stop_cb and stop_cb():
+            if logger:
+                logger("任务已被用户中止")
+            break
         try:
             df = load_price_df(code, start_date=start_date, end_date=end_date)
             if df.empty or len(df) < 80:
@@ -1271,7 +1310,8 @@ def scan_market_and_rank(index_flag: str, start_date: str, end_date: str, adjust
     # TopN
     if df_res.empty:
         return df_res
-    df_res = df_res.sort_values(["qscore", "score", "mom10"], ascending=[False, False, False]).head(topN).reset_index(drop=True)
+    df_res = df_res.sort_values(["qscore", "score", "mom10"], ascending=[False, False, False]).head(topN).reset_index(
+        drop=True)
     return df_res
 
 
@@ -1457,12 +1497,14 @@ def compute_metrics_from_curve(nav: pd.Series, period_days: int) -> Dict[str, fl
 def backtest_topN(weights_pack: Optional[Dict[str, Any]],
                   codes: List[str], start_date: str, end_date: str,
                   topN: int, hold_days: int, min_amt20: float = 2e8,
-                  fee_bps: float = 1.0, logger=None) -> Tuple[pd.DataFrame, pd.Series]:
+                  fee_bps: float = 1.0, logger=None,
+                  stop_cb: Optional[Callable[[], bool]] = None) -> Tuple[pd.DataFrame, pd.Series]:
     """
     简易回测：每 hold_days 调仓一次，按当日打分选 TopN 等权持有 hold_days
     - 支持无模型（使用基线打分）
     - 交易费率：单边 bps（如1=万分之一）
     返回：交易期收益表 period_returns（date, ret），净值序列 nav（按调仓期）
+    - stop_cb: 可选，支持中止
     """
     if not codes:
         return pd.DataFrame(), pd.Series(dtype=float)
@@ -1476,6 +1518,10 @@ def backtest_topN(weights_pack: Optional[Dict[str, Any]],
 
     data_map: Dict[str, pd.DataFrame] = {}
     for code in codes:
+        if stop_cb and stop_cb():
+            if logger:
+                logger("任务已被用户中止")
+            break
         df = load_price_df(code, start_date=start_date, end_date=end_date)
         if df.empty or len(df) < max(60, hold_days + 10):
             continue
@@ -1485,7 +1531,7 @@ def backtest_topN(weights_pack: Optional[Dict[str, Any]],
     if not data_map:
         return pd.DataFrame(), pd.Series(dtype=float)
 
-    # 所有交易日（用交集或并集？用并集，然后每期以可交易样本为准）
+    # 所有交易日（用并集，然后每期以可交易样本为准）
     all_dates = sorted(list(set(np.concatenate([df["date"].values for df in data_map.values()]))))
     if len(all_dates) < hold_days + 2:
         return pd.DataFrame(), pd.Series(dtype=float)
@@ -1493,12 +1539,17 @@ def backtest_topN(weights_pack: Optional[Dict[str, Any]],
     # 生成调仓日期序列（每 hold_days 一个）
     rebalance_dates = all_dates[::hold_days]
     # 确保有未来持有期
-    rebalance_dates = [d for d in rebalance_dates if (d in all_dates) and (all_dates.index(d) + hold_days < len(all_dates))]
+    rebalance_dates = [d for d in rebalance_dates if
+                       (d in all_dates) and (all_dates.index(d) + hold_days < len(all_dates))]
     if not rebalance_dates:
         return pd.DataFrame(), pd.Series(dtype=float)
 
     period_rets = []
     for d in rebalance_dates:
+        if stop_cb and stop_cb():
+            if logger:
+                logger("任务已被用户中止")
+            break
         # 这期的可选股票与打分
         basket = []
         for code, df in data_map.items():
@@ -1558,13 +1609,16 @@ def backtest_topN(weights_pack: Optional[Dict[str, Any]],
 class EvoAdvisorApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("A股进化式投研助手 - Baostock（重构优化版，单文件GUI）")
+        self.title(f"{APP_NAME} v{APP_VERSION} - Baostock")
         self.geometry("1380x960")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        # 取消/停止控制
+        self.cancel_event = threading.Event()
+
         # 变量（去掉预设股票）
         self.codes_var = tk.StringVar(value="")
-        self.start_var = tk.StringVar(value="2015-01-01")
+        self.start_var = tk.StringVar(value="2024-09-24")
         self.end_var = tk.StringVar(value=dt.datetime.now().strftime(DATE_FMT))
         self.horizon_var = tk.IntVar(value=10)
         self.adjustflag_var = tk.StringVar(value="2")
@@ -1608,10 +1662,18 @@ class EvoAdvisorApp(tk.Tk):
         self.bt_fee_bps_var = tk.DoubleVar(value=1.0)  # 单边bp
         self.bt_min_amt20_var = tk.DoubleVar(value=2e8)
 
+        # 主题
+        self.theme_var = tk.StringVar(value="light")  # light / dark
+
         # 状态栏
         self.status_var = tk.StringVar(value="就绪")
 
+        # UI 初始化
+        self._init_style()
+        self._build_menu()
         self._build_ui()
+        self._load_config()  # 恢复配置
+        self._apply_theme(self.theme_var.get())
 
         # baostock 登录
         try:
@@ -1621,6 +1683,76 @@ class EvoAdvisorApp(tk.Tk):
         except Exception as e:
             self.log(f"[错误] {e}", error=True)
             self.set_status("未登录 baostock（离线模式）")
+
+        # 启动时刷新用户操作
+        self.refresh_ops()
+
+    # ---------- 样式与主题 ----------
+    def _init_style(self):
+        self.style = ttk.Style()
+        # 兼容平台主题
+        try:
+            self.style.theme_use("clam")
+        except Exception:
+            pass
+
+    def _apply_theme(self, theme: str):
+        if theme == "dark":
+            bg = "#20252b";
+            fg = "#e6edf3";
+            acc = "#2b90d9"
+            self.configure(bg=bg)
+            # 配置常见控件
+            for element in ["TFrame", "TLabelframe", "TLabelframe.Label", "TLabel", "TButton", "TNotebook",
+                            "TNotebook.Tab", "TEntry", "TCombobox", "Treeview"]:
+                try:
+                    self.style.configure(element, background=bg, foreground=fg, fieldbackground="#2a3036")
+                except Exception:
+                    pass
+            try:
+                self.style.map("TButton", foreground=[("active", fg)], background=[("active", acc)])
+                self.style.configure("Treeview", background="#262c33", fieldbackground="#262c33", foreground=fg,
+                                     rowheight=22)
+            except Exception:
+                pass
+        else:
+            # light
+            try:
+                self.style.theme_use("clam")
+            except Exception:
+                pass
+
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+
+        # 文件
+        menu_file = tk.Menu(menubar, tearoff=0)
+        menu_file.add_command(label="导出扫描结果CSV", command=self.export_scan_csv)
+        menu_file.add_separator()
+        menu_file.add_command(label="导出最新权重...", command=self.on_export_weights)
+        menu_file.add_command(label="导入权重...", command=self.on_import_weights)
+        menu_file.add_separator()
+        menu_file.add_command(label="退出", command=self.on_close)
+        menubar.add_cascade(label="文件", menu=menu_file)
+
+        # 视图
+        menu_view = tk.Menu(menubar, tearoff=0)
+        menu_view.add_radiobutton(label="浅色主题", variable=self.theme_var, value="light",
+                                  command=lambda: self._apply_theme("light"))
+        menu_view.add_radiobutton(label="深色主题", variable=self.theme_var, value="dark",
+                                  command=lambda: self._apply_theme("dark"))
+        menubar.add_cascade(label="视图", menu=menu_view)
+
+        # 帮助
+        menu_help = tk.Menu(menubar, tearoff=0)
+        menu_help.add_command(label="关于", command=self._on_about)
+        menubar.add_cascade(label="帮助", menu=menu_help)
+
+        self.config(menu=menubar)
+
+    def _on_about(self):
+        messagebox.showinfo("关于",
+                            f"{APP_NAME}\n版本：v{APP_VERSION}\n\n开源组件：tkinter/pandas/numpy/matplotlib/baostock\n仅用于研究学习，不构成投资建议。")
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -1681,6 +1813,9 @@ class EvoAdvisorApp(tk.Tk):
         status_bar = ttk.Frame(self, padding=4)
         status_bar.pack(fill=tk.X, side=tk.BOTTOM)
         ttk.Label(status_bar, textvariable=self.status_var, foreground="green").pack(side=tk.LEFT)
+        # 停止按钮
+        self.btn_stop = ttk.Button(status_bar, text="停止任务", command=self.on_stop_tasks)
+        self.btn_stop.pack(side=tk.RIGHT, padx=6)
 
     def _add_tree_with_scroll(self, parent, columns, height=12, widths: Optional[Dict[str, int]] = None):
         """
@@ -1707,25 +1842,30 @@ class EvoAdvisorApp(tk.Tk):
         ttk.Label(frm, text="股票代码(逗号/换行分隔)").grid(row=0, column=0, sticky="e")
         ttk.Entry(frm, textvariable=self.codes_var, width=80).grid(row=0, column=1, columnspan=4, sticky="we", padx=6)
         ttk.Button(frm, text="导入股票列表文件", command=self.on_import_codes).grid(row=0, column=5, padx=6, sticky="w")
-        ttk.Button(frm, text="从指数填充（HS300）", command=self.fill_codes_from_index_hs300).grid(row=0, column=6, padx=6, sticky="w")
+        ttk.Button(frm, text="从指数填充（HS300）", command=self.fill_codes_from_index_hs300).grid(row=0, column=6,
+                                                                                                 padx=6, sticky="w")
         ttk.Label(frm, text="自定义池状态:").grid(row=0, column=7, sticky="e")
         ttk.Label(frm, textvariable=self.custom_count_var, foreground="blue").grid(row=0, column=8, sticky="w")
 
-        ttk.Checkbutton(frm, text="训练用自定义池", variable=self.use_custom_for_train_var).grid(row=1, column=1, sticky="w")
-        ttk.Checkbutton(frm, text="扫描用自定义池", variable=self.use_custom_for_scan_var).grid(row=1, column=2, sticky="w")
+        ttk.Checkbutton(frm, text="训练用自定义池", variable=self.use_custom_for_train_var).grid(row=1, column=1,
+                                                                                                 sticky="w")
+        ttk.Checkbutton(frm, text="扫描用自定义池", variable=self.use_custom_for_scan_var).grid(row=1, column=2,
+                                                                                                sticky="w")
 
         ttk.Label(frm, text="起始日期").grid(row=2, column=0, sticky="e")
         ttk.Entry(frm, textvariable=self.start_var, width=12).grid(row=2, column=1, sticky="w")
         ttk.Label(frm, text="结束日期").grid(row=2, column=2, sticky="e")
         ttk.Entry(frm, textvariable=self.end_var, width=12).grid(row=2, column=3, sticky="w")
         ttk.Label(frm, text="复权").grid(row=2, column=4, sticky="e")
-        ttk.Combobox(frm, textvariable=self.adjustflag_var, values=["1", "2", "3"], width=6, state="readonly").grid(row=2, column=5, sticky="w")
+        ttk.Combobox(frm, textvariable=self.adjustflag_var, values=["1", "2", "3"], width=6, state="readonly").grid(
+            row=2, column=5, sticky="w")
 
         btns = ttk.Frame(parent, padding=8)
         btns.pack(fill=tk.X)
         self.btn_update = ttk.Button(btns, text="增量更新数据（按输入框/自定义池）", command=self.on_update_data_async)
         self.btn_update.pack(side=tk.LEFT, padx=6)
-        ttk.Label(btns, text="说明：增量拉取baostock数据并写入SQLite；离线模式将仅使用本地数据").pack(side=tk.LEFT, padx=8)
+        ttk.Label(btns, text="说明：增量拉取baostock数据并写入SQLite；离线模式将仅使用本地数据").pack(side=tk.LEFT,
+                                                                                                    padx=8)
 
     def _build_page_train(self, parent):
         frm = ttk.LabelFrame(parent, text="训练配置", padding=8)
@@ -1734,9 +1874,11 @@ class EvoAdvisorApp(tk.Tk):
         ttk.Label(frm, text="预测视野H(日)").grid(row=0, column=0, sticky="e")
         ttk.Entry(frm, textvariable=self.horizon_var, width=8).grid(row=0, column=1, sticky="w", padx=4)
         ttk.Label(frm, text="训练模式").grid(row=0, column=2, sticky="e")
-        ttk.Combobox(frm, textvariable=self.train_mode_var, values=["ridge_cv", "ga"], width=12, state="readonly").grid(row=0, column=3, sticky="w", padx=4)
+        ttk.Combobox(frm, textvariable=self.train_mode_var, values=["ridge_cv", "ga"], width=12, state="readonly").grid(
+            row=0, column=3, sticky="w", padx=4)
         ttk.Label(frm, text="目标指标").grid(row=0, column=4, sticky="e")
-        ttk.Combobox(frm, textvariable=self.target_metric_var, values=["IC", "MSE"], width=8, state="readonly").grid(row=0, column=5, sticky="w", padx=4)
+        ttk.Combobox(frm, textvariable=self.target_metric_var, values=["IC", "MSE"], width=8, state="readonly").grid(
+            row=0, column=5, sticky="w", padx=4)
         ttk.Label(frm, text="CV折数").grid(row=0, column=6, sticky="e")
         ttk.Entry(frm, textvariable=self.cv_folds_var, width=6).grid(row=0, column=7, sticky="w", padx=4)
 
@@ -1754,10 +1896,18 @@ class EvoAdvisorApp(tk.Tk):
         self.pb = ttk.Progressbar(btns, mode="indeterminate", length=240)
         self.pb.pack(side=tk.LEFT, padx=8)
 
+        # 权重导入/导出
+        self.btn_export_w = ttk.Button(btns, text="导出最新权重", command=self.on_export_weights)
+        self.btn_export_w.pack(side=tk.LEFT, padx=6)
+        self.btn_import_w = ttk.Button(btns, text="导入权重", command=self.on_import_weights)
+        self.btn_import_w.pack(side=tk.LEFT, padx=6)
+
         # 结果表
-        cols = ("timestamp","horizon","method","lambda","ic","icir","mse","n_days")
+        cols = ("timestamp", "horizon", "method", "lambda", "ic", "icir", "mse", "n_days")
         frame, self.train_tree = self._add_tree_with_scroll(parent, columns=cols, height=8,
-                                                            widths={"timestamp":160,"horizon":70,"method":110,"lambda":90,"ic":80,"icir":80,"mse":120,"n_days":80})
+                                                            widths={"timestamp": 160, "horizon": 70, "method": 110,
+                                                                    "lambda": 90, "ic": 80, "icir": 80, "mse": 120,
+                                                                    "n_days": 80})
         frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
     def _build_page_adv(self, parent):
@@ -1775,15 +1925,18 @@ class EvoAdvisorApp(tk.Tk):
 
         cols = ("date", "code", "name", "score", "advice", "reasoning", "horizon")
         frame, self.adv_tree = self._add_tree_with_scroll(parent, columns=cols, height=12,
-                                                          widths={"date":100, "code":90, "name":120, "score":80, "advice":240, "reasoning":840, "horizon":80})
+                                                          widths={"date": 100, "code": 90, "name": 120, "score": 80,
+                                                                  "advice": 240, "reasoning": 840, "horizon": 80})
         frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
     def _build_page_scan(self, parent):
         frm = ttk.LabelFrame(parent, text="扫描参数", padding=8)
         frm.pack(fill=tk.X, padx=8, pady=6)
         ttk.Label(frm, text="指数/池").grid(row=0, column=0, sticky="e")
-        ttk.Combobox(frm, textvariable=self.index_flag_var, values=["HS300", "ZZ500", "SZ50", "ALL", "CUSTOM"], width=10, state="readonly").grid(row=0, column=1, sticky="w", padx=4)
-        ttk.Checkbutton(frm, text="使用自定义池", variable=self.use_custom_for_scan_var).grid(row=0, column=2, sticky="w")
+        ttk.Combobox(frm, textvariable=self.index_flag_var, values=["HS300", "ZZ500", "SZ50", "ALL", "CUSTOM"],
+                     width=10, state="readonly").grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Checkbutton(frm, text="使用自定义池", variable=self.use_custom_for_scan_var).grid(row=0, column=2,
+                                                                                              sticky="w")
         ttk.Button(frm, text="导入股票列表文件", command=self.on_import_codes).grid(row=0, column=3, padx=6)
         ttk.Label(frm, text="状态:").grid(row=0, column=4, sticky="e")
         ttk.Label(frm, textvariable=self.custom_count_var, foreground="blue").grid(row=0, column=5, sticky="w")
@@ -1799,21 +1952,27 @@ class EvoAdvisorApp(tk.Tk):
 
         frm2 = ttk.LabelFrame(parent, text="ALL扫描优化 / 高级筛选", padding=8)
         frm2.pack(fill=tk.X, padx=8, pady=6)
-        ttk.Checkbutton(frm2, text="扫描前跳过增量更新（快）", variable=self.skip_update_before_scan_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(frm2, text="扫描前跳过增量更新（快）", variable=self.skip_update_before_scan_var).grid(row=0,
+                                                                                                             column=0,
+                                                                                                             sticky="w")
         ttk.Label(frm2, text="批大小").grid(row=0, column=1, sticky="e")
         ttk.Entry(frm2, textvariable=self.batch_size_var, width=8).grid(row=0, column=2, sticky="w", padx=4)
         ttk.Label(frm2, text="批间隔(ms)").grid(row=0, column=3, sticky="e")
         ttk.Entry(frm2, textvariable=self.sleep_ms_var, width=8).grid(row=0, column=4, sticky="w", padx=4)
 
-        ttk.Checkbutton(frm2, text="启用波动Z阈值", variable=self.filter_volz_enable_var).grid(row=1, column=0, sticky="w")
+        ttk.Checkbutton(frm2, text="启用波动Z阈值", variable=self.filter_volz_enable_var).grid(row=1, column=0,
+                                                                                               sticky="w")
         ttk.Label(frm2, text="max vol_z").grid(row=1, column=1, sticky="e")
         ttk.Entry(frm2, textvariable=self.max_vol_z_var, width=8).grid(row=1, column=2, sticky="w", padx=4)
         ttk.Checkbutton(frm2, text="启用RSI区间", variable=self.filter_rsi_enable_var).grid(row=1, column=3, sticky="w")
         ttk.Label(frm2, text="RSI[min,max]").grid(row=1, column=4, sticky="e")
         ttk.Entry(frm2, textvariable=self.rsi_min_var, width=6).grid(row=1, column=5, sticky="w", padx=2)
         ttk.Entry(frm2, textvariable=self.rsi_max_var, width=6).grid(row=1, column=6, sticky="w", padx=2)
-        ttk.Checkbutton(frm2, text="要求趋势(价>SMA20>SMA60, MACD>0, SMA20上行)", variable=self.require_trend_var).grid(row=2, column=0, columnspan=4, sticky="w")
-        ttk.Checkbutton(frm2, text="要求接近55日高(≥98%)", variable=self.require_breakout_var).grid(row=2, column=4, columnspan=3, sticky="w")
+        ttk.Checkbutton(frm2, text="要求趋势(价>SMA20>SMA60, MACD>0, SMA20上行)", variable=self.require_trend_var).grid(
+            row=2, column=0, columnspan=4, sticky="w")
+        ttk.Checkbutton(frm2, text="要求接近55日高(≥98%)", variable=self.require_breakout_var).grid(row=2, column=4,
+                                                                                                    columnspan=3,
+                                                                                                    sticky="w")
 
         btns = ttk.Frame(parent, padding=8)
         btns.pack(fill=tk.X)
@@ -1853,7 +2012,7 @@ class EvoAdvisorApp(tk.Tk):
 
         cols = ("date", "ret")
         frame, self.bt_tree = self._add_tree_with_scroll(parent, columns=cols, height=10,
-                                                         widths={"date":120, "ret":120})
+                                                         widths={"date": 120, "ret": 120})
         frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
         frm_m = ttk.Frame(parent, padding=6)
@@ -1872,30 +2031,37 @@ class EvoAdvisorApp(tk.Tk):
         ttk.Entry(frm, textvariable=self.eval_end_var, width=12).grid(row=0, column=3, sticky="w", padx=4)
         ttk.Label(frm, text="类型").grid(row=0, column=4, sticky="e")
         self.eval_type_var = tk.StringVar(value="ALL")
-        ttk.Combobox(frm, textvariable=self.eval_type_var, values=["ALL", "BUY", "SELL"], width=8, state="readonly").grid(row=0, column=5, sticky="w", padx=4)
+        ttk.Combobox(frm, textvariable=self.eval_type_var, values=["ALL", "BUY", "SELL"], width=8,
+                     state="readonly").grid(row=0, column=5, sticky="w", padx=4)
         ttk.Label(frm, text="H(日)").grid(row=0, column=6, sticky="e")
         self.eval_hz_var = tk.StringVar(value="")  # 可为空表示按当时的horizon
         ttk.Entry(frm, textvariable=self.eval_hz_var, width=6).grid(row=0, column=7, sticky="w", padx=4)
 
         btns = ttk.Frame(parent, padding=8)
         btns.pack(fill=tk.X)
-        ttk.Button(btns, text="评估历史建议绩效（若自选表选中则仅该股）", command=self.on_evaluate).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="评估历史建议绩效（若自选表选中则仅该股）", command=self.on_evaluate).pack(side=tk.LEFT,
+                                                                                                       padx=6)
         ttk.Button(btns, text="查看/导出建议历史（可按选中股）", command=self.on_view_history).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="分位统计（按score分组）", command=self.on_quant_stats).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="绘制收益分布图", command=self.on_plot_ret_hist).pack(side=tk.LEFT, padx=6)
 
-        frame1, self.eval_tree = self._add_tree_with_scroll(parent, columns=("type","n","avg_ret","win_rate"), height=8,
-                                                            widths={"type":140,"n":120,"avg_ret":120,"win_rate":120})
+        frame1, self.eval_tree = self._add_tree_with_scroll(parent, columns=("type", "n", "avg_ret", "win_rate"),
+                                                            height=8,
+                                                            widths={"type": 140, "n": 120, "avg_ret": 120,
+                                                                    "win_rate": 120})
         frame1.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
-        frame2, self.quant_tree = self._add_tree_with_scroll(parent, columns=("quantile","n","avg_ret","win_rate"), height=6,
-                                                             widths={"quantile":120,"n":120,"avg_ret":120,"win_rate":120})
+        frame2, self.quant_tree = self._add_tree_with_scroll(parent, columns=("quantile", "n", "avg_ret", "win_rate"),
+                                                             height=6,
+                                                             widths={"quantile": 120, "n": 120, "avg_ret": 120,
+                                                                     "win_rate": 120})
         frame2.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
     def _build_page_plot(self, parent):
         btns = ttk.Frame(parent, padding=8)
         btns.pack(fill=tk.X)
-        ttk.Button(btns, text="绘图（若自选表有选中则绘该股，否则取输入框首个）", command=self.on_plot).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="绘图（若自选表有选中则绘该股，否则取输入框首个）", command=self.on_plot).pack(side=tk.LEFT,
+                                                                                                          padx=6)
 
     def _build_page_ops(self, parent):
         frm = ttk.LabelFrame(parent, text="记录每日操作（买/卖/调仓）", padding=8)
@@ -1909,7 +2075,8 @@ class EvoAdvisorApp(tk.Tk):
         ttk.Label(frm, text="代码").grid(row=0, column=0, sticky="e")
         ttk.Entry(frm, textvariable=self.op_code_var, width=12).grid(row=0, column=1, sticky="w", padx=4)
         ttk.Label(frm, text="动作").grid(row=0, column=2, sticky="e")
-        ttk.Combobox(frm, textvariable=self.op_action_var, values=["BUY","SELL","ADJ"], width=8, state="readonly").grid(row=0, column=3, sticky="w")
+        ttk.Combobox(frm, textvariable=self.op_action_var, values=["BUY", "SELL", "ADJ"], width=8,
+                     state="readonly").grid(row=0, column=3, sticky="w")
         ttk.Label(frm, text="日期").grid(row=0, column=4, sticky="e")
         ttk.Entry(frm, textvariable=self.op_date_var, width=12).grid(row=0, column=5, sticky="w", padx=4)
         ttk.Label(frm, text="价格").grid(row=0, column=6, sticky="e")
@@ -1921,9 +2088,11 @@ class EvoAdvisorApp(tk.Tk):
         ttk.Button(frm, text="保存操作", command=self.on_save_op).grid(row=0, column=12, padx=6)
 
         frame, self.op_tree = self._add_tree_with_scroll(parent,
-                                                         columns=("date","code","name","action","price","qty","note"),
+                                                         columns=("date", "code", "name", "action", "price", "qty",
+                                                                  "note"),
                                                          height=10,
-                                                         widths={"date":100,"code":90,"name":120,"action":80,"price":100,"qty":100,"note":480})
+                                                         widths={"date": 100, "code": 90, "name": 120, "action": 80,
+                                                                 "price": 100, "qty": 100, "note": 480})
         frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
         ttk.Button(parent, text="刷新操作记录", command=self.refresh_ops).pack(pady=4)
 
@@ -1949,6 +2118,7 @@ class EvoAdvisorApp(tk.Tk):
    - 设置 horizon（H日）、训练模式（ridge_cv/ga）、目标指标（IC/MSE）  
    - ridge_cv：时间序列CV自动选λ；ga：进化搜索特征子集+λ（更强但更慢）  
    - 训练完成自动保存权重，并展示IC/ICIR/MSE等评估；自选建议/扫描/回测将自动使用最新权重  
+   - 支持“导出/导入权重（JSON）”，便于迁移与交付  
 
 4. 自选建议  
    - 在“自选建议”页粘贴/填充股票列表，设置资金与风险参数，点击“生成扩展建议并保存”  
@@ -1958,20 +2128,21 @@ class EvoAdvisorApp(tk.Tk):
    - 指数支持 HS300/ZZ500/SZ50/ALL/CUSTOM；也可勾选“扫描用自定义池”  
    - 可勾选“跳过增量更新（快）”，在ALL大范围扫描时建议先离线用本地数据  
    - 高级筛选：趋势/接近55日高/波动Z阈值/RSI区间/流动性阈值  
-   - 结果支持导出CSV；无权重时将使用“基线打分”也能得到排序结果  
+   - 结果支持导出CSV；无权重时将使用“基线打分”得到排序结果  
 
 6. 回测  
    - 设置 TopN、持有H日、费率、流动性阈值，点击“开始回测”  
    - 回测按每H日等权调仓TopN；输出期收益表、净值曲线与指标（年化、回撤、Sharpe、胜率）  
    - 若无权重则使用“基线打分”进行回测  
+   - 可随时点击底部“停止任务”中止  
 
 7. 绩效/历史  
    - 可按“日期范围、类型（ALL/BUY/SELL）、H(日)”筛选评估历史建议的表现  
    - 支持分位统计、收益分布图、导出历史  
 
-8. 用户操作（连续化进化）  
-   - 记录每日操作（买/卖/调仓），保存到本地，自动显示列表  
-   - 系统会计算已知的盈亏与风险提示（为后续个性化进化、挖掘习惯提供数据基础）  
+8. 主题与配置  
+   - 顶部菜单“视图”可切换浅色/深色主题  
+   - 所有参数在退出时会自动保存，下次启动自动恢复  
 
 常见问题：  
 - baostock 未安装/登录失败：请先 pip install baostock，再重启程序  
@@ -2000,8 +2171,18 @@ class EvoAdvisorApp(tk.Tk):
 
     def log(self, msg: str, error: bool = False):
         prefix = "[ERROR] " if error else ""
-        self.log_text.insert(tk.END, f"{dt.datetime.now().strftime('%H:%M:%S')} {prefix}{msg}\n")
-        self.log_text.see(tk.END)
+        text = f"{dt.datetime.now().strftime('%H:%M:%S')} {prefix}{msg}\n"
+        try:
+            self.log_text.insert(tk.END, text)
+            self.log_text.see(tk.END)
+        except Exception:
+            pass
+        # 写入文件
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            pass
         self.update_idletasks()
 
     def set_status(self, text: str):
@@ -2014,6 +2195,13 @@ class EvoAdvisorApp(tk.Tk):
         except Exception:
             pass
 
+    def on_stop_tasks(self):
+        self.cancel_event.set()
+        self.log("收到停止任务请求...")
+
+    def _clear_cancel(self):
+        self.cancel_event.clear()
+
     def _set_busy(self, busy: bool, doing: str = ""):
         try:
             if busy:
@@ -2025,7 +2213,8 @@ class EvoAdvisorApp(tk.Tk):
                 self.set_status("就绪")
         except Exception:
             pass
-        for name in ["btn_update","btn_train","btn_adv","btn_scan","btn_export_scan","btn_bt"]:
+        for name in ["btn_update", "btn_train", "btn_adv", "btn_scan", "btn_export_scan", "btn_bt", "btn_export_w",
+                     "btn_import_w"]:
             btn = getattr(self, name, None)
             if btn is None:
                 continue
@@ -2034,6 +2223,89 @@ class EvoAdvisorApp(tk.Tk):
             except Exception:
                 pass
         self.update_idletasks()
+
+    # ---------- 配置持久化 ----------
+    def _load_config(self):
+        if not os.path.exists(CONFIG_PATH):
+            return
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            # 恢复关键参数
+            self.start_var.set(cfg.get("start_date", self.start_var.get()))
+            self.end_var.set(cfg.get("end_date", self.end_var.get()))
+            self.horizon_var.set(int(cfg.get("horizon", self.horizon_var.get())))
+            self.adjustflag_var.set(cfg.get("adjustflag", self.adjustflag_var.get()))
+            self.train_mode_var.set(cfg.get("train_mode", self.train_mode_var.get()))
+            self.target_metric_var.set(cfg.get("target_metric", self.target_metric_var.get()))
+            self.cv_folds_var.set(int(cfg.get("cv_folds", self.cv_folds_var.get())))
+            self.ga_pop_var.set(int(cfg.get("ga_pop", self.ga_pop_var.get())))
+            self.ga_gen_var.set(int(cfg.get("ga_gen", self.ga_gen_var.get())))
+            self.index_flag_var.set(cfg.get("index_flag", self.index_flag_var.get()))
+            self.min_amt20_var.set(float(cfg.get("min_amt20", self.min_amt20_var.get())))
+            self.topN_var.set(int(cfg.get("topN", self.topN_var.get())))
+            self.capital_var.set(float(cfg.get("capital", self.capital_var.get())))
+            self.risk_pct_var.set(float(cfg.get("risk_pct", self.risk_pct_var.get())))
+            self.skip_update_before_scan_var.set(bool(cfg.get("skip_update", self.skip_update_before_scan_var.get())))
+            self.batch_size_var.set(int(cfg.get("batch_size", self.batch_size_var.get())))
+            self.sleep_ms_var.set(int(cfg.get("sleep_ms", self.sleep_ms_var.get())))
+            self.require_trend_var.set(bool(cfg.get("require_trend", self.require_trend_var.get())))
+            self.require_breakout_var.set(bool(cfg.get("require_breakout", self.require_breakout_var.get())))
+            self.max_vol_z_var.set(float(cfg.get("max_vol_z", self.max_vol_z_var.get())))
+            self.filter_volz_enable_var.set(bool(cfg.get("filter_volz_enable", self.filter_volz_enable_var.get())))
+            self.rsi_min_var.set(float(cfg.get("rsi_min", self.rsi_min_var.get())))
+            self.rsi_max_var.set(float(cfg.get("rsi_max", self.rsi_max_var.get())))
+            self.filter_rsi_enable_var.set(bool(cfg.get("filter_rsi_enable", self.filter_rsi_enable_var.get())))
+            self.bt_topN_var.set(int(cfg.get("bt_topN", self.bt_topN_var.get())))
+            self.bt_hold_var.set(int(cfg.get("bt_hold", self.bt_hold_var.get())))
+            self.bt_fee_bps_var.set(float(cfg.get("bt_fee_bps", self.bt_fee_bps_var.get())))
+            self.bt_min_amt20_var.set(float(cfg.get("bt_min_amt20", self.bt_min_amt20_var.get())))
+            self.theme_var.set(cfg.get("theme", self.theme_var.get()))
+            # 自定义池路径提示（不自动加载，避免路径变动报错）
+            if cfg.get("custom_codes_path"):
+                self.custom_codes_path = cfg.get("custom_codes_path")
+                self.custom_count_var.set(f"路径已记录：{os.path.basename(self.custom_codes_path)}（需手动导入）")
+        except Exception as e:
+            self.log(f"读取配置失败：{e}", error=True)
+
+    def _save_config(self):
+        try:
+            cfg = {
+                "start_date": self.start_var.get().strip(),
+                "end_date": self.end_var.get().strip(),
+                "horizon": int(self.horizon_var.get()),
+                "adjustflag": self.adjustflag_var.get().strip(),
+                "train_mode": self.train_mode_var.get().strip(),
+                "target_metric": self.target_metric_var.get().strip(),
+                "cv_folds": int(self.cv_folds_var.get()),
+                "ga_pop": int(self.ga_pop_var.get()),
+                "ga_gen": int(self.ga_gen_var.get()),
+                "index_flag": self.index_flag_var.get().strip(),
+                "min_amt20": float(self.min_amt20_var.get()),
+                "topN": int(self.topN_var.get()),
+                "capital": float(self.capital_var.get()),
+                "risk_pct": float(self.risk_pct_var.get()),
+                "skip_update": bool(self.skip_update_before_scan_var.get()),
+                "batch_size": int(self.batch_size_var.get()),
+                "sleep_ms": int(self.sleep_ms_var.get()),
+                "require_trend": bool(self.require_trend_var.get()),
+                "require_breakout": bool(self.require_breakout_var.get()),
+                "max_vol_z": float(self.max_vol_z_var.get()),
+                "filter_volz_enable": bool(self.filter_volz_enable_var.get()),
+                "rsi_min": float(self.rsi_min_var.get()),
+                "rsi_max": float(self.rsi_max_var.get()),
+                "filter_rsi_enable": bool(self.filter_rsi_enable_var.get()),
+                "bt_topN": int(self.bt_topN_var.get()),
+                "bt_hold": int(self.bt_hold_var.get()),
+                "bt_fee_bps": float(self.bt_fee_bps_var.get()),
+                "bt_min_amt20": float(self.bt_min_amt20_var.get()),
+                "theme": self.theme_var.get(),
+                "custom_codes_path": self.custom_codes_path or ""
+            }
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.log(f"保存配置失败：{e}", error=True)
 
     # ---------- 文件/指数填充 ----------
     def on_import_codes(self):
@@ -2100,12 +2372,72 @@ class EvoAdvisorApp(tk.Tk):
             self.log(f"HS300填充失败: {e}", error=True)
             messagebox.showerror("错误", str(e))
 
+    # ---------- 权重导出/导入 ----------
+    def on_export_weights(self):
+        try:
+            w = load_latest_weights()
+            if not w:
+                messagebox.showinfo("提示", "尚无已保存的最新权重")
+                return
+            path = filedialog.asksaveasfilename(
+                title="导出最新权重为JSON",
+                defaultextension=".json",
+                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+            )
+            if not path:
+                return
+            data = {
+                "timestamp": w["timestamp"], "horizon": int(w["horizon"]),
+                "features": w["features"], "weights": list(map(float, w["weights"].ravel())),
+                "intercept": float(w["intercept"]), "mu": list(map(float, w["mu"].ravel())),
+                "sigma": list(map(float, w["sigma"].ravel())), "lambda": float(w["lambda"]),
+                "notes": w.get("notes", "")
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.log(f"权重已导出：{path}")
+            messagebox.showinfo("完成", f"已导出：{path}")
+        except Exception as e:
+            self.log(f"导出权重失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
+
+    def on_import_weights(self):
+        try:
+            path = filedialog.askopenfilename(
+                title="导入权重（JSON）",
+                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+            )
+            if not path:
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            features = data["features"]
+            weights = np.array(data["weights"], dtype=float)
+            intercept = float(data["intercept"])
+            mu = np.array(data["mu"], dtype=float)
+            sigma = np.array(data["sigma"], dtype=float)
+            lam = float(data.get("lambda", 1e-2))
+            horizon = int(data.get("horizon", self.horizon_var.get()))
+            notes = data.get("notes", "imported")
+            # 保存至DB
+            app_state["horizon"] = horizon
+            ts = save_weights_record(horizon=horizon, features=features, weights=weights, intercept=intercept,
+                                     mu=mu, sigma=sigma, lam=lam,
+                                     notes=json.dumps({"method": "import", "eval": {}, "notes": notes},
+                                                      ensure_ascii=False))
+            self.log(f"权重已导入并保存，时间戳：{ts}")
+            messagebox.showinfo("完成", f"已导入权重，时间戳：{ts}")
+        except Exception as e:
+            self.log(f"导入权重失败: {e}", error=True)
+            messagebox.showerror("错误", str(e))
+
     # ---------- 事件（异步包装） ----------
     def on_update_data_async(self):
         t = threading.Thread(target=self._update_data_worker, daemon=True)
         t.start()
 
     def _update_data_worker(self):
+        self._clear_cancel()
         self._set_busy(True, "更新数据")
         try:
             codes = self.custom_codes if self.use_custom_for_train_var.get() and self.custom_codes else self.parse_codes()
@@ -2116,10 +2448,8 @@ class EvoAdvisorApp(tk.Tk):
             end_date = self.end_var.get().strip()
             adj = self.adjustflag_var.get().strip()
             self.log(f"开始增量更新，标的数={len(codes)}，区间={start_date}~{end_date}，复权={adj}")
-            if bs is None:
-                self.log("未安装baostock，跳过远端拉取，仅使用本地数据", error=True)
-            else:
-                update_data_for_codes(codes, start_date, end_date, adj, logger=self.log)
+            update_data_for_codes(codes, start_date, end_date, adj, logger=self.log,
+                                  stop_cb=lambda: self.cancel_event.is_set())
             self.log("数据更新完成")
             self.beep()
         except Exception as e:
@@ -2133,6 +2463,7 @@ class EvoAdvisorApp(tk.Tk):
         t.start()
 
     def _train_worker(self):
+        self._clear_cancel()
         self._set_busy(True, "训练模型")
         try:
             codes = self.custom_codes if self.use_custom_for_train_var.get() and self.custom_codes else self.parse_codes()
@@ -2167,7 +2498,7 @@ class EvoAdvisorApp(tk.Tk):
             eval_res = notes.get("eval", {})
             vals = (
                 pack["timestamp"], int(pack["horizon"]),
-                notes.get("method",""),
+                notes.get("method", ""),
                 f"{pack['lambda']:.4g}",
                 f"{safe_float(eval_res.get('ic_mean')):.4f}" if eval_res else "",
                 f"{safe_float(eval_res.get('icir')):.4f}" if eval_res else "",
@@ -2188,6 +2519,7 @@ class EvoAdvisorApp(tk.Tk):
         t.start()
 
     def _advise_worker(self):
+        self._clear_cancel()
         self._set_busy(True, "生成建议")
         try:
             codes = self.parse_codes()
@@ -2203,170 +2535,222 @@ class EvoAdvisorApp(tk.Tk):
                 self.adv_tree.delete(i)
 
             adv_records = []
-            # 如果没有权重，仍然可生成基线建议
             feats = w["features"] if w else None
-            ww = w["weights"] if w else None
-            bb = w["intercept"] if w else 0.0
-            mu = w["mu"] if w else None
-            sigma = w["sigma"] if w else None
-            pos_thr = 0.02; neg_thr = -0.02
-            name_map = get_name_map(codes)
+            ww = w  # 可能为 None
 
+            today_str = dt.datetime.now().strftime(DATE_FMT)
             for code in codes:
-                df = load_price_df(code, start_date=start_date)
-                if df.empty:
-                    continue
-                df = compute_indicators(df)
-                if df.empty:
-                    continue
-                last = df.iloc[-1]
-                # 预测/基线分
-                s = np.nan
-                if feats and ww is not None and sigma is not None and all(f in df.columns for f in feats):
-                    x = last[feats].astype(float).values
-                    xz = standardize_apply(x, mu, sigma)
-                    s = float(np.dot(xz, ww) + bb)
-                if not np.isfinite(s):
-                    s = baseline_score_no_model(last)
-                base_adv = score_to_advice(s, pos_thr, neg_thr)
-                base_reason = reasoning_from_signals(last)
-                row = pd.Series({
-                    "close": float(last["close"]),
-                    "mom10": float(last.get("mom10") or 0.0),
-                    "vol20": float(last.get("vol20") or 0.0),
-                    "atr14": float(last.get("atr14") or 0.0),
-                    "score": s
-                })
-                ext_text, ext_reason, pos_pct, stop, target, qty = gen_extended_advice(row, risk_pct=risk_pct, capital=capital)
-                advice_text = ext_text
-                reasoning = f"[{base_adv}] {base_reason} | {ext_reason}"
-                name = name_map.get(code) or get_stock_name(code)
-                self.adv_tree.insert("", tk.END, values=(last["date"], code, name, f"{s:.4f}", advice_text, reasoning, (w["horizon"] if w else int(self.horizon_var.get()))))
-                adv_records.append((str(last["date"]), code, float(s), advice_text, reasoning, int(w["horizon"] if w else self.horizon_var.get())))
+                if self.cancel_event.is_set():
+                    self.log("任务已被用户中止")
+                    break
+                try:
+                    df = load_price_df(code, start_date=self.start_var.get().strip(),
+                                       end_date=self.end_var.get().strip())
+                    if df.empty:
+                        self.log(f"{code} 无本地数据，请先在“数据/股票池”页执行增量更新", error=True)
+                        continue
+                    df = compute_indicators(df)
+                    last = df.iloc[-1]
+                    x_date = str(last["date"])
+                    # 分数（优先模型，否则基线）
+                    s = np.nan
+                    if ww and feats and all(f in df.columns for f in feats):
+                        x = last[feats].astype(float).values
+                        xz = standardize_apply(x, ww["mu"], ww["sigma"])
+                        s = float(np.dot(xz, ww["weights"]) + ww["intercept"])
+                    if not np.isfinite(s):
+                        s = baseline_score_no_model(last)
+
+                    # 扩展建议
+                    advice_text, reason, pos_pct, stop, target, qty = gen_extended_advice(
+                        last, float(self.risk_pct_var.get()), float(self.capital_var.get())
+                    )
+                    name = get_stock_name(code)
+                    if not name and bs is not None:
+                        fetch_and_cache_name(code)
+                        name = get_stock_name(code)
+                    # 插入UI与历史
+                    self.adv_tree.insert("", tk.END, values=(
+                        x_date, code, name, f"{s:.4f}", advice_text, reason,
+                        int(app_state.get("horizon", self.horizon_var.get()))
+                    ))
+                    adv_records.append((x_date, code, float(s), advice_text, reason,
+                                        int(app_state.get("horizon", self.horizon_var.get()))))
+                except Exception as e:
+                    self.log(f"{code} 生成建议失败: {e}", error=True)
+
             if adv_records:
                 insert_advice(adv_records)
-                self.log(f"生成建议 {len(adv_records)} 条，并已持久化")
+                self.log(f"已保存 {len(adv_records)} 条建议记录")
+                messagebox.showinfo("完成", f"已生成并保存 {len(adv_records)} 条建议")
+                self.beep()
             else:
-                self.log("未生成任何建议（可能数据为空或特征缺失）")
-            self.beep()
+                messagebox.showwarning("提示", "未生成任何建议（可能无数据或解析失败）")
         except Exception as e:
             self.log(f"生成建议失败: {e}", error=True)
             messagebox.showerror("错误", str(e))
         finally:
             self._set_busy(False)
 
+    # ---------- 市场扫描 ----------
     def on_scan_market_async(self):
-        t = threading.Thread(target=self._scan_worker, daemon=True)
+        t = threading.Thread(target=self._scan_market_worker, daemon=True)
         t.start()
 
-    def _scan_worker(self):
+    def _scan_market_worker(self):
+        self._clear_cancel()
         self._set_busy(True, "市场扫描")
         try:
-            w = load_latest_weights()  # 允许为空
-            index_flag = self.index_flag_var.get().strip()
+            # 参数
+            index_flag = self.index_flag_var.get().strip().upper()
             start_date = self.start_var.get().strip()
             end_date = self.end_var.get().strip()
-            adj = self.adjustflag_var.get().strip()
+            adjustflag = self.adjustflag_var.get().strip()
             min_amt20 = float(self.min_amt20_var.get())
             topN = int(self.topN_var.get())
             capital = float(self.capital_var.get())
             risk_pct = float(self.risk_pct_var.get())
-            skip_upd = bool(self.skip_update_before_scan_var.get())
+            skip_update = bool(self.skip_update_before_scan_var.get())
             batch_size = int(self.batch_size_var.get())
             sleep_ms = int(self.sleep_ms_var.get())
-
-            # 高级筛选
             require_trend = bool(self.require_trend_var.get())
             require_breakout = bool(self.require_breakout_var.get())
-            max_vol_z = float(self.max_vol_z_var.get()) if self.filter_volz_enable_var.get() else None
-            rsi_min = float(self.rsi_min_var.get()) if self.filter_rsi_enable_var.get() else None
-            rsi_max = float(self.rsi_max_var.get()) if self.filter_rsi_enable_var.get() else None
+            max_vol_z = float(self.max_vol_z_var.get()) if bool(self.filter_volz_enable_var.get()) else None
+            rsi_min = float(self.rsi_min_var.get()) if bool(self.filter_rsi_enable_var.get()) else None
+            rsi_max = float(self.rsi_max_var.get()) if bool(self.filter_rsi_enable_var.get()) else None
 
+            # 权重（可为空）
+            w = load_latest_weights()
             # 自定义池
             codes_override = None
-            if index_flag.upper() == "CUSTOM" or self.use_custom_for_scan_var.get():
-                if not self.custom_codes:
-                    messagebox.showwarning("提示", "未加载自定义股票池")
+            if index_flag == "CUSTOM" or self.use_custom_for_scan_var.get():
+                codes_override = self.custom_codes if self.custom_codes else self.parse_codes()
+                if not codes_override:
+                    messagebox.showwarning("提示", "自定义池为空，请在“数据/股票池”页导入或填写")
                     return
-                codes_override = self.custom_codes
 
-            self.log(f"开始市场扫描：index={index_flag}, Top{topN}, 均额≥{min_amt20:.0f}, skip_update={skip_upd}")
-            df = scan_market_and_rank(
-                index_flag, start_date, end_date, adj, w,
-                min_amt20=min_amt20, topN=topN, logger=self.log,
-                codes_override=codes_override, skip_update=skip_upd,
-                batch_size=batch_size, sleep_ms_between_batches=sleep_ms,
-                require_trend=require_trend, require_breakout=require_breakout,
-                max_vol_z=max_vol_z, rsi_min=rsi_min, rsi_max=rsi_max
+            self.log(
+                f"开始扫描：index={index_flag}{'（自定义池）' if codes_override else ''}, TopN={topN}, min_amt20={min_amt20:,.0f}, 跳过更新={skip_update}")
+            df_res = scan_market_and_rank(
+                index_flag=index_flag, start_date=start_date, end_date=end_date, adjustflag=adjustflag,
+                weights_pack=w, min_amt20=min_amt20, topN=topN, logger=self.log,
+                codes_override=codes_override, skip_update=skip_update, batch_size=batch_size,
+                sleep_ms_between_batches=sleep_ms,
+                require_trend=require_trend, require_breakout=require_breakout, max_vol_z=max_vol_z,
+                rsi_min=rsi_min, rsi_max=rsi_max, stop_cb=lambda: self.cancel_event.is_set()
             )
+            # 清空UI
             for i in self.scan_tree.get_children():
                 self.scan_tree.delete(i)
             self.btn_export_scan.configure(state=tk.DISABLED)
             self.scan_df_cache = None
 
-            if df is None or df.empty:
-                messagebox.showinfo("提示", "未找到符合条件的股票")
+            if df_res is None or df_res.empty:
+                self.log("扫描无结果")
+                messagebox.showinfo("提示", "扫描无结果（可能过滤条件过严或无数据）")
                 return
 
-            records = []
-            ext_rows = []
-            codes = df["code"].tolist()
-            name_map = get_name_map(codes)
-
-            for _, r in df.iterrows():
-                ext_text, ext_reason, pos_pct, stop, target, qty = gen_extended_advice(r, risk_pct=risk_pct, capital=capital)
-                advice_text = ext_text
-                reasoning = f"[质量分={r['qscore']:.3f}] {ext_reason}"
-                records.append((r["date"], r["code"], float(r["score"]), advice_text, reasoning, int(w["horizon"] if w else self.horizon_var.get())))
-                ext_rows.append({
-                    "date": r["date"], "code": r["code"], "name": name_map.get(r["code"]) or get_stock_name(r["code"]),
-                    "close": r["close"], "score": r["score"], "qscore": r["qscore"],
-                    "mom10": r["mom10"], "vol20": r["vol20"], "atr14": r["atr14"], "amt20": r["amt20"],
-                    "trend": r.get("trend", 0.0), "breakout55": r.get("breakout55", 0.0), "dd60": r.get("dd60", 0.0),
-                    "pos_pct": pos_pct, "stop": stop, "target": target, "qty": qty, "advice": advice_text, "reasoning": reasoning
+            # 扩展建议 + 名称
+            rows_ui = []
+            advice_records = []
+            for _, row in df_res.iterrows():
+                if self.cancel_event.is_set():
+                    self.log("任务已被用户中止")
+                    break
+                code = row["code"]
+                name = get_stock_name(code)
+                if not name and bs is not None:
+                    fetch_and_cache_name(code)
+                    name = get_stock_name(code)
+                # 构造一行最小行以生成建议
+                pseudo_row = pd.Series({
+                    "close": row.get("close", np.nan),
+                    "atr14": row.get("atr14", np.nan),
+                    "vol20": row.get("vol20", np.nan),
+                    "mom10": row.get("mom10", np.nan)
                 })
-            insert_advice(records)
-            self.log(f"市场扫描完成，生成建议 {len(records)} 条（已持久化）")
-
-            df_ext = pd.DataFrame(ext_rows)
-            self.scan_df_cache = df_ext.copy()
-            self.btn_export_scan.configure(state=tk.NORMAL)
-
-            for _, r in df_ext.iterrows():
-                self.scan_tree.insert("", tk.END, values=(
-                    r["date"], r["code"], r.get("name",""), f"{r['close']:.2f}",
-                    f"{r['score']:.4f}", f"{r['qscore']:.4f}",
-                    f"{r['mom10']:.2%}", f"{r['vol20']:.3f}",
-                    f"{r['atr14']:.3f}", f"{r['amt20']:.0f}",
-                    f"{r.get('trend',0):.0f}", f"{r.get('breakout55',0):.0f}", f"{r.get('dd60',0):.2%}",
-                    f"{r['pos_pct'] * 100:.1f}%", f"{r['stop']:.2f}", f"{r['target']:.2f}", int(r["qty"]),
-                    r["advice"], r["reasoning"],                     r["advice"], r["reasoning"]
+                advice_text, reason, pos_pct, stop, target, qty = gen_extended_advice(pseudo_row, risk_pct, capital)
+                # UI行
+                vals = (
+                    str(row.get("date", "")), code, name,
+                    f"{float(row.get('close', np.nan)):.2f}" if np.isfinite(row.get("close", np.nan)) else "",
+                    f"{float(row.get('score', np.nan)):.4f}" if np.isfinite(row.get("score", np.nan)) else "",
+                    f"{float(row.get('qscore', np.nan)):.4f}" if np.isfinite(row.get("qscore", np.nan)) else "",
+                    f"{float(row.get('mom10', np.nan)):.2%}" if np.isfinite(row.get("mom10", np.nan)) else "",
+                    f"{float(row.get('vol20', np.nan)):.2f}" if np.isfinite(row.get("vol20", np.nan)) else "",
+                    f"{float(row.get('atr14', np.nan)):.2f}" if np.isfinite(row.get("atr14", np.nan)) else "",
+                    f"{float(row.get('amt20', np.nan)) / 1e8:.2f}亿" if np.isfinite(
+                        row.get("amt20", np.nan)) else "",
+                    int(row.get("trend", 0)),
+                    int(row.get("breakout55", 0)),
+                    f"{float(row.get('dd60', np.nan)):.2%}" if np.isfinite(row.get("dd60", np.nan)) else "",
+                    f"{pos_pct * 100:.1f}%",
+                    f"{stop:.2f}",
+                    f"{target:.2f}",
+                    int(qty),
+                    advice_text,
+                    reason
+                )
+                self.scan_tree.insert("", tk.END, values=vals)
+                rows_ui.append({
+                    "date": row.get("date", ""),
+                    "code": code,
+                    "name": name,
+                    "close": row.get("close", np.nan),
+                    "score": row.get("score", np.nan),
+                    "qscore": row.get("qscore", np.nan),
+                    "mom10": row.get("mom10", np.nan),
+                    "vol20": row.get("vol20", np.nan),
+                    "atr14": row.get("atr14", np.nan),
+                    "amt20": row.get("amt20", np.nan),
+                    "trend": row.get("trend", np.nan),
+                    "breakout55": row.get("breakout55", np.nan),
+                    "dd60": row.get("dd60", np.nan),
+                    "pos_pct": pos_pct,
+                    "stop": stop,
+                    "target": target,
+                    "qty": qty,
+                    "advice": advice_text,
+                    "reasoning": reason
+                })
+                # 同时写 advice 历史（便于绩效评估）
+                advice_records.append((
+                    str(row.get("date", "")), code, float(row.get("score", 0.0)), advice_text, reason,
+                    int(app_state.get("horizon", self.horizon_var.get()))
                 ))
+
+            if advice_records:
+                insert_advice(advice_records)
+
+            # 缓存导出
+            self.scan_df_cache = pd.DataFrame(rows_ui)
+            self.btn_export_scan.configure(state=tk.NORMAL)
+            self.log(f"扫描完成，共 {len(rows_ui)} 条；建议记录已追加 {len(advice_records)} 条")
             self.beep()
         except Exception as e:
-            self.log(f"市场扫描失败: {e}", error=True)
+            self.log(f"扫描失败: {e}", error=True)
             messagebox.showerror("错误", str(e))
         finally:
             self._set_busy(False)
 
     def export_scan_csv(self):
-        if self.scan_df_cache is None or self.scan_df_cache.empty:
-            messagebox.showinfo("提示", "没有可导出的扫描结果")
-            return
-        path = filedialog.asksaveasfilename(
-            title="导出扫描结果为CSV",
-            defaultextension=".csv",
-            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")]
-        )
-        if not path:
-            return
         try:
+            if self.scan_df_cache is None or self.scan_df_cache.empty:
+                messagebox.showinfo("提示", "暂无扫描结果可导出")
+                return
+            path = filedialog.asksaveasfilename(
+                title="导出扫描结果CSV",
+                defaultextension=".csv",
+                filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")]
+            )
+            if not path:
+                return
             df = self.scan_df_cache.copy()
             df.to_csv(path, index=False, encoding="utf-8-sig")
             self.log(f"扫描结果已导出：{path}")
             messagebox.showinfo("完成", f"已导出：{path}")
         except Exception as e:
-            self.log(f"导出失败: {e}", error=True)
+            self.log(f"导出扫描结果失败: {e}", error=True)
             messagebox.showerror("错误", str(e))
 
     # ---------- 回测 ----------
@@ -2375,26 +2759,9 @@ class EvoAdvisorApp(tk.Tk):
         t.start()
 
     def _backtest_worker(self):
-        self._set_busy(True, "回测中")
+        self._clear_cancel()
+        self._set_busy(True, "回测")
         try:
-            # 股票池优先级：自定义池 > 输入框 > HS300
-            codes = []
-            if self.custom_codes:
-                codes = self.custom_codes
-                self.log(f"回测使用自定义股票池，数量={len(codes)}")
-            else:
-                codes = self.parse_codes()
-                if codes:
-                    self.log(f"回测使用输入框股票池，数量={len(codes)}")
-            if not codes:
-                if bs is not None:
-                    codes = get_market_codes("HS300", self.end_var.get().strip())
-                    self.log(f"未提供股票池，使用HS300，数量={len(codes)}")
-                else:
-                    messagebox.showwarning("提示", "请先输入或导入股票池（离线模式无法从指数获取）")
-                    return
-
-            w = load_latest_weights()  # 可为空 -> 使用基线打分
             start_date = self.start_var.get().strip()
             end_date = self.end_var.get().strip()
             topN = int(self.bt_topN_var.get())
@@ -2402,32 +2769,51 @@ class EvoAdvisorApp(tk.Tk):
             fee_bps = float(self.bt_fee_bps_var.get())
             min_amt20 = float(self.bt_min_amt20_var.get())
 
-            self.log(f"开始回测：Top{topN}, H={hold_days}, 费率={fee_bps}bps, 均额≥{min_amt20:.0f}")
+            # 股票池：优先自定义，否则取指数设置
+            index_flag = self.index_flag_var.get().strip().upper()
+            if self.use_custom_for_scan_var.get() or index_flag == "CUSTOM":
+                codes = self.custom_codes if self.custom_codes else self.parse_codes()
+            else:
+                try:
+                    codes = get_market_codes(index_flag, end_date)
+                except Exception as e:
+                    self.log(f"获取指数成分失败：{e}", error=True)
+                    codes = self.parse_codes()
+            if not codes:
+                messagebox.showwarning("提示", "股票池为空，请导入或选择指数")
+                return
+
+            w = load_latest_weights()  # 可空
+            self.log(
+                f"开始回测：标的数={len(codes)}, TopN={topN}, H={hold_days}, 费率={fee_bps}bps, min_amt20={min_amt20:,.0f}")
             pr, nav = backtest_topN(
-                w, codes, start_date, end_date,
-                topN=topN, hold_days=hold_days, min_amt20=min_amt20, fee_bps=fee_bps, logger=self.log
+                weights_pack=w, codes=codes, start_date=start_date, end_date=end_date,
+                topN=topN, hold_days=hold_days, min_amt20=min_amt20, fee_bps=fee_bps,
+                logger=self.log, stop_cb=lambda: self.cancel_event.is_set()
             )
+            # 清表
             for i in self.bt_tree.get_children():
                 self.bt_tree.delete(i)
-            if pr.empty:
-                self.bt_metrics_var.set("无有效回测期（可能数据不足或过滤条件过严）")
-                messagebox.showinfo("提示", "无有效回测结果")
+
+            if pr is None or pr.empty or nav is None or nav.empty:
+                self.bt_metrics_var.set("回测结果为空")
+                messagebox.showinfo("提示", "回测无有效期收益（样本/过滤/区间原因）")
                 return
 
             for _, r in pr.iterrows():
-                self.bt_tree.insert("", tk.END, values=(r["date"], f"{float(r['ret']):.3%}"))
+                self.bt_tree.insert("", tk.END, values=(str(r["date"]), f"{float(r['ret']):.2%}"))
 
             metrics = compute_metrics_from_curve(nav, period_days=hold_days)
-            text = f"CAGR={metrics['CAGR']:.2%} | MaxDD={metrics['MaxDD']:.2%} | Sharpe={metrics['Sharpe']:.2f} | 胜率={metrics['WinRate']:.2%}"
-            self.bt_metrics_var.set(text)
-            self.log(f"回测完成：{text}")
+            msg = f"CAGR={metrics['CAGR']:.2%} | MaxDD={metrics['MaxDD']:.2%} | Sharpe={metrics['Sharpe']:.2f} | 胜率={metrics['WinRate']:.2%}"
+            self.bt_metrics_var.set(msg)
+            self.log("回测完成：" + msg)
 
-            # 绘制净值曲线（弹窗）
+            # 绘制净值
             try:
-                fig, ax = plt.subplots(figsize=(8.6, 4.2))
-                nav.plot(ax=ax, color="blue", lw=1.5)
-                ax.set_title("回测净值曲线")
-                ax.grid(True, alpha=0.3)
+                plt.figure(figsize=(8.4, 4.2))
+                nav.plot(title="回测净值曲线", grid=True)
+                plt.xlabel("Date")
+                plt.ylabel("NAV")
                 plt.tight_layout()
                 plt.show()
             except Exception:
@@ -2441,45 +2827,39 @@ class EvoAdvisorApp(tk.Tk):
             self._set_busy(False)
 
     # ---------- 绩效/历史 ----------
-    def _get_selected_code_from_any(self) -> Optional[str]:
-        # 优先取扫描表，其次自选建议表
-        try:
-            sel = self.scan_tree.selection()
-            if sel:
-                vals = self.scan_tree.item(sel[0], "values")
-                return normalize_code(vals[1]) if vals and len(vals) > 1 else None
-        except Exception:
-            pass
+    def _get_selected_code_from_adv(self) -> Optional[str]:
         try:
             sel = self.adv_tree.selection()
-            if sel:
-                vals = self.adv_tree.item(sel[0], "values")
-                return normalize_code(vals[1]) if vals and len(vals) > 1 else None
+            if not sel:
+                return None
+            vals = self.adv_tree.item(sel[0], "values")
+            code = vals[1] if len(vals) > 1 else None
+            return code
         except Exception:
-            pass
-        return None
+            return None
 
     def on_evaluate(self):
         try:
-            code = self._get_selected_code_from_any()
             start_date = self.eval_start_var.get().strip() or None
             end_date = self.eval_end_var.get().strip() or None
             typ = self.eval_type_var.get().strip().upper()
-            if typ == "ALL":
-                typ = None
+            typ = None if typ == "ALL" else typ
             hz_txt = self.eval_hz_var.get().strip()
             horizon = int(hz_txt) if hz_txt else None
-            df = evaluate_history_performance(code=code, start_date=start_date, end_date=end_date,
-                                              type_filter=typ, horizon=horizon)
+            code = self._get_selected_code_from_adv()
+
+            df = evaluate_history_performance(
+                code=code, limit=1000, start_date=start_date, end_date=end_date, type_filter=typ, horizon=horizon
+            )
+            # 清表
             for i in self.eval_tree.get_children():
                 self.eval_tree.delete(i)
             if df is None or df.empty:
                 messagebox.showinfo("提示", "无可评估的历史建议")
                 return
             for _, r in df.iterrows():
-                self.eval_tree.insert("", tk.END, values=(
-                    r["type"], int(r["n"]), f"{float(r['avg_ret']):.3%}", f"{float(r['win_rate']):.2%}"
-                ))
+                self.eval_tree.insert("", tk.END, values=(r["type"], int(r["n"]), f"{float(r['avg_ret']):.2%}",
+                                                          f"{float(r['win_rate']):.2%}"))
             self.log("历史建议绩效评估完成")
         except Exception as e:
             self.log(f"评估失败: {e}", error=True)
@@ -2487,72 +2867,52 @@ class EvoAdvisorApp(tk.Tk):
 
     def on_view_history(self):
         try:
-            code = self._get_selected_code_from_any()
             start_date = self.eval_start_var.get().strip() or None
             end_date = self.eval_end_var.get().strip() or None
             typ = self.eval_type_var.get().strip().upper()
-            if typ == "ALL":
-                typ = None
+            typ = None if typ == "ALL" else typ
+            code = self._get_selected_code_from_adv()
+
             rows = query_advice(code=code, limit=2000, start_date=start_date, end_date=end_date, type_filter=typ)
             if not rows:
-                messagebox.showinfo("提示", "无历史建议记录")
+                messagebox.showinfo("提示", "没有历史建议可导出")
                 return
-            win = tk.Toplevel(self)
-            win.title("历史建议记录")
-            cols = ("date","code","name","score","advice","reasoning","horizon")
-            frame = ttk.Frame(win, padding=6)
-            frame.pack(fill=tk.BOTH, expand=True)
-            tree = ttk.Treeview(frame, columns=cols, show="headings", height=18)
-            vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-            tree.configure(yscrollcommand=vsb.set)
-            tree.grid(row=0, column=0, sticky="nsew")
-            vsb.grid(row=0, column=1, sticky="ns")
-            frame.rowconfigure(0, weight=1)
-            frame.columnconfigure(0, weight=1)
-            widths = {"date":100,"code":100,"name":120,"score":80,"advice":260,"reasoning":800,"horizon":80}
-            for c in cols:
-                tree.heading(c, text=c)
-                tree.column(c, width=widths.get(c, 120), anchor=tk.W)
-            codes = list(sorted(set([r[1] for r in rows])))
-            name_map = get_name_map(codes)
-            for date, code_, score, advice, reasoning, hz in rows:
-                tree.insert("", tk.END, values=(date, code_, name_map.get(code_) or get_stock_name(code_),
-                                                f"{float(score):.4f}", advice, reasoning, int(hz)))
-            def _export():
-                path = filedialog.asksaveasfilename(
-                    title="导出历史建议为CSV",
-                    defaultextension=".csv",
-                    filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")]
-                )
-                if not path:
-                    return
-                df = pd.DataFrame(rows, columns=["date","code","score","advice","reasoning","horizon"])
-                df["name"] = df["code"].map(lambda x: name_map.get(x) or get_stock_name(x))
-                df = df[["date","code","name","score","advice","reasoning","horizon"]]
-                df.to_csv(path, index=False, encoding="utf-8-sig")
-                messagebox.showinfo("完成", f"已导出：{path}")
-            ttk.Button(win, text="导出CSV", command=_export).pack(pady=4)
+            df = pd.DataFrame(rows, columns=["date", "code", "score", "advice", "reasoning", "horizon"])
+            # 名称
+            df["name"] = df["code"].apply(get_stock_name)
+            # 导出
+            path = filedialog.asksaveasfilename(
+                title="导出建议历史CSV",
+                defaultextension=".csv",
+                filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")]
+            )
+            if not path:
+                return
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+            self.log(f"已导出建议历史：{path}")
+            messagebox.showinfo("完成", f"已导出：{path}")
         except Exception as e:
-            self.log(f"查看历史失败: {e}", error=True)
+            self.log(f"导出历史失败: {e}", error=True)
             messagebox.showerror("错误", str(e))
 
     def on_quant_stats(self):
         try:
-            code = self._get_selected_code_from_any()
             start_date = self.eval_start_var.get().strip() or None
             end_date = self.eval_end_var.get().strip() or None
             hz_txt = self.eval_hz_var.get().strip()
             horizon = int(hz_txt) if hz_txt else None
-            df = evaluate_quantile_performance(code=code, start_date=start_date, end_date=end_date, horizon=horizon, q=5)
+
+            df = evaluate_quantile_performance(code=None, limit=2000, start_date=start_date, end_date=end_date,
+                                               horizon=horizon, q=5)
             for i in self.quant_tree.get_children():
                 self.quant_tree.delete(i)
             if df is None or df.empty:
-                messagebox.showinfo("提示", "无分位统计数据")
+                messagebox.showinfo("提示", "无分位统计结果")
                 return
             for _, r in df.iterrows():
-                self.quant_tree.insert("", tk.END, values=(
-                    int(r["quantile"]), int(r["n"]), f"{float(r['avg_ret']):.3%}", f"{float(r['win_rate']):.2%}"
-                ))
+                self.quant_tree.insert("", tk.END,
+                                       values=(int(r["quantile"]), int(r["n"]), f"{float(r['avg_ret']):.2%}",
+                                               f"{float(r['win_rate']):.2%}"))
             self.log("分位统计完成")
         except Exception as e:
             self.log(f"分位统计失败: {e}", error=True)
@@ -2560,87 +2920,83 @@ class EvoAdvisorApp(tk.Tk):
 
     def on_plot_ret_hist(self):
         try:
-            code = self._get_selected_code_from_any()
             start_date = self.eval_start_var.get().strip() or None
             end_date = self.eval_end_var.get().strip() or None
             hz_txt = self.eval_hz_var.get().strip()
-            horizon = int(hz_txt) if hz_txt else None
-            rows = query_advice(code=code, limit=2000, start_date=start_date, end_date=end_date, type_filter=None)
+            horizon = int(hz_txt) if hz_txt else int(app_state.get("horizon", self.horizon_var.get()))
+
+            rows = query_advice(code=None, limit=2000, start_date=start_date, end_date=end_date, type_filter=None)
             if not rows:
-                messagebox.showinfo("提示", "无历史建议记录")
+                messagebox.showinfo("提示", "无历史建议可绘图")
                 return
-            vals = []
-            for date, code_, score, advice, reasoning, hz in rows:
-                hz_use = int(horizon) if horizon is not None else int(hz)
-                ret = _find_future_return(code_, date, hz_use)
-                if ret is None:
-                    continue
-                typ = _parse_basic_advice(advice or "")
-                signed_ret = ret if typ in ("买入", "强烈买入") else (-ret if typ in ("卖出","强烈卖出") else 0.0)
-                vals.append(signed_ret)
-            if not vals:
-                messagebox.showinfo("提示", "无可绘制的收益数据")
+            rets = []
+            for date, code, score, advice, reasoning, hz in rows:
+                hz_use = horizon if horizon is not None else int(hz)
+                r = _find_future_return(code, date, hz_use)
+                if r is not None:
+                    rets.append(float(r))
+            if not rets:
+                messagebox.showinfo("提示", "无法计算任何收益（数据不足）")
                 return
-            plt.figure(figsize=(7.6,4.2))
-            plt.hist(vals, bins=40, color="#4c72b0", alpha=0.85)
-            plt.title("签名收益分布（历史建议）")
-            plt.xlabel("收益")
-            plt.ylabel("频数")
-            plt.grid(True, alpha=0.25)
+            plt.figure(figsize=(7, 4))
+            plt.hist(rets, bins=40, alpha=0.8, color="#4e79a7")
+            plt.title("建议后H日收益分布")
+            plt.xlabel("Return")
+            plt.ylabel("Frequency")
+            plt.grid(True, alpha=0.3)
             plt.tight_layout()
             plt.show()
         except Exception as e:
             self.log(f"绘图失败: {e}", error=True)
             messagebox.showerror("错误", str(e))
 
-    # ---------- 图表 ----------
+    # ---------- 绘图 ----------
     def on_plot(self):
         try:
-            code = self._get_selected_code_from_any()
+            # 优先取“自选建议”表选中，否则取输入框首个
+            code = self._get_selected_code_from_adv()
             if not code:
                 codes = self.parse_codes()
-                if not codes:
-                    messagebox.showwarning("提示", "无可绘制的股票代码")
-                    return
-                code = codes[0]
-            start_date = self.start_var.get().strip()
-            end_date = self.end_var.get().strip()
-            df = load_price_df(code, start_date=start_date, end_date=end_date)
-            if df.empty:
-                messagebox.showinfo("提示", "该区间无数据")
+                code = codes[0] if codes else None
+            if not code:
+                messagebox.showwarning("提示", "请先在“自选建议”页选中一只股票或在输入框填写代码")
                 return
-            df = compute_indicators(df)
-            name = get_stock_name(code) or code
 
-            # 画3子图：价格+SMA/BOLL，MACD，RSI
-            fig = plt.figure(figsize=(9.6, 6.8))
-            gs = fig.add_gridspec(3, 1, height_ratios=[3, 1.5, 1.2], hspace=0.1)
+            df = load_price_df(code, start_date=self.start_var.get().strip(), end_date=self.end_var.get().strip())
+            if df.empty:
+                messagebox.showinfo("提示", f"{code} 无本地数据，请先更新")
+                return
+            df = compute_indicators(df).dropna(subset=["sma20", "sma60", "dif", "dea", "macd"], how="any")
+            if df.empty:
+                messagebox.showinfo("提示", "指标数据不足，无法绘图")
+                return
 
-            ax1 = fig.add_subplot(gs[0, 0])
-            ax1.plot(pd.to_datetime(df["date"]), df["close"], label="Close", color="#333333")
-            ax1.plot(pd.to_datetime(df["date"]), df["sma20"], label="SMA20", color="#1f77b4")
-            ax1.plot(pd.to_datetime(df["date"]), df["sma60"], label="SMA60", color="#ff7f0e")
-            ax1.fill_between(pd.to_datetime(df["date"]), df["bb_low"], df["bb_up"], color="#1f77b4", alpha=0.08, label="BOLL")
-            ax1.set_title(f"{name} ({code})")
-            ax1.grid(True, alpha=0.3)
-            ax1.legend(loc="upper left")
+            name = get_stock_name(code)
+            dt_idx = pd.to_datetime(df["date"])
+            close = df["close"]
+            sma20 = df["sma20"]
+            sma60 = df["sma60"]
+            macd = df["macd"]
+            dif = df["dif"]
+            dea = df["dea"]
+            bb_up = df.get("bb_up", pd.Series(index=df.index, data=np.nan))
+            bb_low = df.get("bb_low", pd.Series(index=df.index, data=np.nan))
 
-            ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
-            ax2.plot(pd.to_datetime(df["date"]), df["macd"], label="MACD", color="#2ca02c")
-            ax2.plot(pd.to_datetime(df["date"]), df["dif"], label="DIF", color="#d62728", alpha=0.8)
-            ax2.plot(pd.to_datetime(df["date"]), df["dea"], label="DEA", color="#9467bd", alpha=0.8)
-            ax2.grid(True, alpha=0.25)
-            ax2.legend(loc="upper left")
+            fig, axs = plt.subplots(2, 1, figsize=(9.6, 6.4), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+            axs[0].plot(dt_idx, close, label="Close", color="#4e79a7")
+            axs[0].plot(dt_idx, sma20, label="SMA20", color="#e15759")
+            axs[0].plot(dt_idx, sma60, label="SMA60", color="#59a14f")
+            axs[0].plot(dt_idx, bb_up, label="BB_UP", color="#9c755f", alpha=0.6, linestyle="--")
+            axs[0].plot(dt_idx, bb_low, label="BB_LOW", color="#9c755f", alpha=0.6, linestyle="--")
+            axs[0].set_title(f"{code} {name}")
+            axs[0].grid(True, alpha=0.3)
+            axs[0].legend(loc="best")
 
-            ax3 = fig.add_subplot(gs[2, 0], sharex=ax1)
-            ax3.plot(pd.to_datetime(df["date"]), df["rsi14"], label="RSI14", color="#8c564b")
-            ax3.axhline(30, color="red", lw=0.8, ls="--", alpha=0.6)
-            ax3.axhline(70, color="green", lw=0.8, ls="--", alpha=0.6)
-            ax3.grid(True, alpha=0.25)
-            ax3.legend(loc="upper left")
-
-            plt.setp(ax1.get_xticklabels(), visible=False)
-            plt.setp(ax2.get_xticklabels(), visible=False)
+            axs[1].bar(dt_idx, macd, label="MACD", color=np.where(macd >= 0, "#76b7b2", "#f28e2b"), alpha=0.8)
+            axs[1].plot(dt_idx, dif, label="DIF", color="#e15759")
+            axs[1].plot(dt_idx, dea, label="DEA", color="#59a14f")
+            axs[1].grid(True, alpha=0.3)
+            axs[1].legend(loc="best")
 
             plt.tight_layout()
             plt.show()
@@ -2649,26 +3005,6 @@ class EvoAdvisorApp(tk.Tk):
             messagebox.showerror("错误", str(e))
 
     # ---------- 用户操作 ----------
-    def refresh_ops(self):
-        try:
-            for i in self.op_tree.get_children():
-                self.op_tree.delete(i)
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("SELECT date, code, action, price, qty, note FROM user_ops ORDER BY date DESC, id DESC LIMIT 1000")
-            rows = c.fetchall()
-            conn.close()
-            codes = list(sorted(set([r[1] for r in rows])))
-            name_map = get_name_map(codes)
-            for d, code, act, price, qty, note in rows:
-                self.op_tree.insert("", tk.END, values=(
-                    d, code, name_map.get(code) or get_stock_name(code), act, f"{safe_float(price):.3f}", int(qty or 0), note or ""
-                ))
-            self.log("操作记录已刷新")
-        except Exception as e:
-            self.log(f"刷新操作记录失败: {e}", error=True)
-            messagebox.showerror("错误", str(e))
-
     def on_save_op(self):
         try:
             code_raw = self.op_code_var.get().strip()
@@ -2676,46 +3012,79 @@ class EvoAdvisorApp(tk.Tk):
             if not code:
                 messagebox.showwarning("提示", "请输入有效的股票代码")
                 return
+            action = self.op_action_var.get().strip().upper()
             date = self.op_date_var.get().strip()
-            # 简单校验日期
-            try:
-                dt.datetime.strptime(date, DATE_FMT)
-            except Exception:
-                messagebox.showwarning("提示", "日期格式应为 YYYY-MM-DD")
-                return
-            act = self.op_action_var.get().strip().upper()
-            if act not in ("BUY","SELL","ADJ"):
-                messagebox.showwarning("提示", "动作仅支持 BUY/SELL/ADJ")
-                return
-            price = float(self.op_price_var.get() or 0.0)
-            qty = int(self.op_qty_var.get() or 0)
+            price = float(self.op_price_var.get())
+            qty = int(self.op_qty_var.get())
             note = self.op_note_var.get().strip()
 
             conn = get_conn()
             c = conn.cursor()
-            c.execute("INSERT INTO user_ops(date, code, action, price, qty, note) VALUES(?,?,?,?,?,?)",
-                      (date, code, act, price, qty, note))
+            c.execute("""
+                      INSERT INTO user_ops(date, code, action, price, qty, note)
+                      VALUES (?, ?, ?, ?, ?, ?)
+                      """, (date, code, action, price, qty, note))
             conn.commit()
             conn.close()
-            fetch_and_cache_name(code)
+            self.log(f"已保存操作：{date} {code} {action} {price} x {qty}")
             self.refresh_ops()
-            messagebox.showinfo("完成", "操作已保存")
         except Exception as e:
             self.log(f"保存操作失败: {e}", error=True)
             messagebox.showerror("错误", str(e))
 
+    def refresh_ops(self):
+        try:
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("""
+                      SELECT date, code, action, price, qty, note
+                      FROM user_ops
+                      ORDER BY date DESC, id DESC
+                      LIMIT 300
+                      """)
+            rows = c.fetchall()
+            conn.close()
+            # 清表
+            for i in self.op_tree.get_children():
+                self.op_tree.delete(i)
+            # 插入
+            for r in rows:
+                date, code, action, price, qty, note = r
+                name = get_stock_name(code)
+                self.op_tree.insert("", tk.END,
+                                    values=(date, code, name, action, f"{float(price):.2f}", int(qty), note))
+        except Exception as e:
+            self.log(f"刷新操作记录失败: {e}", error=True)
+
     # ---------- 关闭 ----------
     def on_close(self):
+        try:
+            self._save_config()
+        except Exception:
+            pass
         try:
             bs_safe_logout()
         except Exception:
             pass
-        self.destroy()
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
-# =========================== 启动入口 ===========================
+# ============== 主入口 ==============
 if __name__ == "__main__":
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        print(f"初始化数据库失败: {e}")
     app = EvoAdvisorApp()
-    app.refresh_ops()
-    app.mainloop()
+    try:
+        app.mainloop()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            bs_safe_logout()
+        except Exception:
+            pass

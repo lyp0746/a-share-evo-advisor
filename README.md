@@ -1,410 +1,442 @@
-# A股“进化式”投研助手（进化优化版，单文件 GUI）使用说明
+# A股进化式投研助手（进化版）用户与技术文档
 
-本文档基于提供的代码文件 a_share_evo_advisor.py，整理为一份完整、细致的使用与实现指南，适合作为 README/用户手册。内容覆盖安装与运行、界面功能、数据与模型、回测与绩效评估、数据库结构、扩展开发建议与常见问题排查。
+> 版本：v1.3.0  
+> 项目名称：A股进化式投研助手（单文件 GUI）  
+> 数据源：baostock  
+> 数据持久化：SQLite  
+> 图形界面：tkinter + matplotlib（TkAgg）
 
-- 项目定位：面向 A 股的“进化式”投研工具，数据源为 baostock，支持因子构建、Ridge 回归与遗传算法进化选因子、市场扫描、回测、建议生成和历史绩效评估。
-- 运行形态：单文件 GUI 应用（tkinter），SQLite 持久化，matplotlib 集成绘图。
-- 使用门槛低：不要求预置股票池，可从指数/文件导入，离线也可用（需本地已缓存数据）。
+本项目提供一套集 数据增量更新、特征工程、模型训练（含进化/遗传特征选择）、市场扫描、建议生成、回测与绩效评估、用户操作记录 于一体的 A 股投研工作台。即使无已训练权重亦可运行（基线打分模式），适合快速探索与持续迭代。
 
----
-
-## 1. 功能一览
-
-- 数据与持久化
-  - baostock 接入，支持“增量拉取”K 线（避免全量重复下载）
-  - SQLite 数据库保存价格、名称、建议、权重、用户操作等
-  - 代码归一化和名称缓存
-- 指标与因子
-  - 技术指标：SMA/EMA/MACD/RSI/ATR/BOLL/KDJ/CCI/WR/OBV/MFI/CMF/BBP/Range/Gap/动量/波动等
-  - 特征裁剪与标准化；目标收益剪裁
-- 模型训练与进化
-  - Ridge 回归（时间序列 CV 自动选 λ；可选优化目标 IC 或 MSE）
-  - 遗传算法选择“特征子集+λ”，以验证集 Rank IC 为目标最大化
-- 建议与扩展建议
-  - 支持“无模型时”的基线打分策略
-  - 扩展建议（仓位/止损/止盈/建议数量）
-- 市场扫描与筛选
-  - HS300/ZZ500/SZ50/ALL/CUSTOM
-  - 增强质量分 qscore；高级筛选：趋势、接近 55 日高、波动 Z 阈值、RSI 区间、流动性阈值
-  - ALL 扫描批处理限速与“跳过增量更新”
-- 回测
-  - TopN 选股、等权持有 H 日、单边费率、输出 CAGR/回撤/Sharpe/胜率，绘制净值
-- 绩效评估与可视化
-  - 历史建议筛选（日期/类型/H）、分位统计、收益分布直方图
-- 用户操作记录
-  - BUY/SELL/ADJ 记录，便于后续行为分析与“连续化进化”
+本文档覆盖安装部署、核心概念、功能说明、操作流程、数据与模型细节、数据库结构、导入导出、常见问题与性能优化等，力求详细清晰、开箱即用。
 
 ---
 
-## 2. 环境与安装
+## 目录
 
-- 必需
-  - Python 3.8+（建议）
-  - tkinter（GUI 依赖）
-  - SQLite（Python 原生 sqlite3 库即可）
-- Python 包
-  - pip install baostock pandas numpy matplotlib
-
-系统环境补充：
-- Windows：一般自带 Tk 支持
-- macOS/Linux：若启动报 Tk/TkAgg 错，可安装 Tk 支持
-  - Ubuntu/Debian: `sudo apt-get install python3-tk`
-  - macOS（Homebrew）: `brew install python-tk@3.x`（按环境调整）
-
-中文字体：
-- matplotlib 使用 SimHei/WenQuanYi 等中文字体显示；若字体缺失可能导致中文乱码，可安装相应字体或改用系统已装字体。
-
----
-
-## 3. 启动与首次使用
-
-- 启动
-  ```bash
-  python a_share_evo_advisor.py
-  ```
-- 首次推荐流程
-  1) “数据/股票池”页：
-     - 填写“起始/结束日期”和“复权”方式
-     - 通过“从指数填充（HS300）”或“导入股票列表文件”获取股票池
-     - 点击“增量更新数据”
-  2) “训练/进化”页：
-     - 设置 H（日）、训练模式（ridge_cv/ga）、目标（IC/MSE）
-     - 开始训练，自动选择 λ（或遗传进化选因子+λ），保存权重
-  3) “自选建议”或“市场扫描”页：
-     - 选择指数/自定义池，调整筛选与风险参数
-     - 生成扩展建议并保存，或扫描全市场并导出
-  4) “回测”页：
-     - 设置 TopN 和持有 H 日、费率与流动性阈值，回测策略表现
-  5) “绩效/历史”页：
-     - 按日期/类型/H 评估历史建议表现，查看分位统计与直方图
-
-说明：
-- 未安装 baostock 或登录失败时，程序仍可离线使用“本地已存数据”（advisor.db）。
-- 首次需联网更新数据，否则离线无数据无法训练/扫描。
+- [快速开始](#快速开始)
+- [运行环境与安装](#运行环境与安装)
+- [整体架构与数据流](#整体架构与数据流)
+- [数据库结构](#数据库结构)
+- [功能详解](#功能详解)
+  - [股票池与数据更新](#股票池与数据更新)
+  - [特征工程](#特征工程)
+  - [训练与进化](#训练与进化)
+  - [自选建议（扩展建议/仓位止损止盈）](#自选建议扩展建议仓位止损止盈)
+  - [市场扫描（无权重亦可）](#市场扫描无权重亦可)
+  - [回测（TopN 等权 + H 日持有）](#回测topn-等权--h-日持有)
+  - [绩效评估与历史](#绩效评估与历史)
+  - [用户操作记录](#用户操作记录)
+  - [图表与可视化](#图表与可视化)
+- [模型与指标细节](#模型与指标细节)
+- [权重导入导出与格式](#权重导入导出与格式)
+- [配置与日志](#配置与日志)
+- [性能优化建议](#性能优化建议)
+- [常见问题 FAQ](#常见问题-faq)
+- [风险提示与免责声明](#风险提示与免责声明)
 
 ---
 
-## 4. GUI 页面详解
+## 快速开始
 
-### 4.1 数据 / 股票池
-- 股票代码输入：支持逗号/换行分隔，格式自动归一化：
-  - 600000 → sh.600000
-  - 000001 → sz.000001
-  - 600000.SH / 000001.SZ 均可
-- 导入股票列表文件：
-  - .txt：每行一个代码
-  - .csv：默认首列或列名为 code/证券代码/ts_code/wind_code
-- 从指数填充：HS300
-- 复权：1-后复权 / 2-前复权 / 3-不复权（默认 2）
-- 增量更新：对已存在的 code 从“数据库最新日期+1”拉取至“结束日期”
+1. 安装依赖
+   - Python 3.8+（建议 3.9/3.10）
+   - pip 安装：`pip install baostock pandas numpy matplotlib`
 
-### 4.2 训练 / 进化
-- 参数
-  - H（日）：预测视野（未来 H 日收益）
-  - 训练模式：ridge_cv 或 ga
-  - 目标指标：IC（横截面 Rank IC 最大化）或 MSE（均方误差最小化）
-  - CV 折数：时间序列交叉验证
-  - GA 参数：种群大小、代数
-- 训练结果展示：timestamp、H、method、lambda、IC、ICIR、MSE、有效交易天数 n_days
+2. 运行程序
+   - 命令行：`python a_share_evo_advisor.py`
+   - 首次启动会初始化本地 SQLite 数据库 `advisor.db`，并尝试 baostock 登录（失败也可离线使用本地数据）
 
-建议：
-- 初学者：先用 `ridge_cv + IC`，H=10~20，CV=4
-- GA 模式耗时更长，适用于更大样本与更强泛化的需求
+3. 快速使用
+   - 页签“数据/股票池”：导入/输入股票池，设置日期与复权，点击“增量更新数据”
+   - 页签“训练/进化”：设置 H（日）、训练模式与目标指标，点击“开始训练/进化”
+   - 页签“自选建议”：填写资金与风险参数，生成扩展建议并保存（写入历史 advice 表）
+   - 页签“市场扫描”：选择指数/池与过滤条件，开始扫描并导出 CSV
+   - 页签“回测”：设定 TopN/H/费率/流动性阈值，运行回测查看年化、回撤、Sharpe、胜率
+   - 页签“绩效/历史”：评估历史建议、做分位统计与收益分布
+   - 页签“用户操作”：记录每日 BUY/SELL/ADJ 以留痕
 
-### 4.3 自选建议
-- 输入自选股票，设置资金与单笔风险％（如 1%）
-- “生成扩展建议并保存”：持久化到 advice 表
-- 每条包含：
-  - 预测分（或基线分），建议（买/卖/强烈买入/强烈卖出/观望）
-  - 扩展建议：建议仓位、止损、止盈、建议数量（按 100 股一手）
-  - 理由简述（常规信号如站上 SMA20、MACD 红柱、RSI 区间等）
+---
 
-### 4.4 市场扫描
-- 指数池：HS300/ZZ500/SZ50/ALL/CUSTOM
-- 高级筛选：
-  - 趋势：价>SMA20>SMA60 且 MACD>0 且 SMA20 上行
-  - 接近 55 日高：≥98%
-  - 波动 Z 阈值：限制高波动
-  - RSI 区间
-  - 流动性阈值：近 20 日均额
-- 无权重也可扫描：使用“基线打分”排序
-- 建议支持导出 CSV
+## 运行环境与安装
 
-ALL 扫描性能建议：
-- 勾选“扫描前跳过增量更新”
-- 调整批处理 batch_size 与 sleep 间隔以降低接口压力
+- Python：3.8+（Win/Mac/Linux 均可）
+- 依赖库：
+  - baostock（数据源）
+  - pandas / numpy（数据处理与数值计算）
+  - matplotlib（绘图，TkAgg 后端）
+  - tkinter（GUI，Linux 需单独安装：Ubuntu/Debian `sudo apt install python3-tk`）
+- 字体：内置中文字体优先级 ["SimHei", "WenQuanYi Micro Hei", "Heiti TC", "sans-serif"]，确保中文图表显示正常
 
-### 4.5 回测
-- 策略：每 H 日调仓一次，按当日打分选 TopN 等权持有 H 日
-- 支持无权重（“基线打分”）
-- 交易费率：单边 bps（如 1=万分之一）
+安装示例：
+```bash
+pip install baostock pandas numpy matplotlib
+# Linux 若缺 tkinter：
+# sudo apt-get update && sudo apt-get install -y python3-tk
+python a_share_evo_advisor.py
+```
+
+---
+
+## 整体架构与数据流
+
+- 数据获取
+  - 通过 baostock 拉取日线 K 数据，增量写入本地 SQLite（表：`prices`）
+  - 支持复权选项：1-后复权、2-前复权、3-不复权
+
+- 特征工程
+  - 对本地数据计算技术指标与派生特征（SMA/EMA/MACD/RSI/ATR/BOLL/KDJ/CCI/WR/OBV/MFI/CMF/BBP/波动/动量/Gap/Range 等）
+
+- 模型训练
+  - 岭回归（带拦截，拦截不正则化），时间序列交叉验证选择 λ，目标可选 IC 或 MSE
+  - 遗传算法（GA）进化特征子集 + λ，以验证 Rank IC 为适应度
+
+- 生成建议与市场扫描
+  - 无权重时也可使用“基线打分”排序
+  - 支持扩展建议生成（仓位、止损、止盈、建议数量）
+
+- 回测与评估
+  - TopN 等权，H 日持有，计算期收益并年化
+  - 历史建议绩效/分位统计/收益分布
+
+- 持久化
+  - SQLite：价格、建议、权重、元数据、股票名称缓存、用户操作记录
+  - 最新权重自动标记于 meta.latest_weights_ts
+
+---
+
+## 数据库结构
+
+数据库文件：`advisor.db`
+
+- 表 `prices`（行情）
+  - 主键：(code, date)
+  - 字段：open/high/low/close/volume/amount
+  - 索引：`idx_prices_date`、`idx_prices_code`
+
+- 表 `advice`（建议历史）
+  - 字段：date, code, score, advice, reasoning, horizon
+  - 用于绩效评估与导出
+
+- 表 `weights`（模型权重）
+  - 字段：timestamp（主键）, horizon, features(JSON), weights(JSON), intercept, mu(JSON), sigma(JSON), lambda, notes
+  - 元信息 `notes` 会保存方法、CV 结果、评估指标等
+
+- 表 `meta`
+  - 键值对存储，如 `('latest_weights_ts', timestamp)`
+
+- 表 `stock_names`
+  - 股票代码与中文名称缓存
+
+- 表 `user_ops`
+  - 用户操作记录：date, code, action(BUY/SELL/ADJ), price, qty, note
+
+---
+
+## 功能详解
+
+### 股票池与数据更新
+
+- 输入代码格式（自动归一化）：
+  - 支持 `sh.600000` / `sz.000001`
+  - 纯 6 位数字：`600000 -> sh.600000`；`000001/300xxx -> sz.000001`
+  - 支持 `600000.SH / 000001.SZ`
+- 股票池来源：
+  - 手工输入（逗号/换行分隔）
+  - 导入 `.txt`（每行一个）或 `.csv`（首列或名为 code/证券代码/ts_code/wind_code）
+  - 从指数填充（HS300）；亦支持 ZZ500/SZ50/ALL/CUSTOM（扫描页）
+- 增量更新：
+  - 根据 DB 最新日期 +1 作为真实起始拉取，避免重复写入
+  - 登录失败或未安装 baostock 时进入离线模式，仅使用本地数据
+- 参数：
+  - 日期范围（起始/结束）
+  - 复权方式（1/2/3）
+
+提示：指标计算与训练对样本量有最低需求。实践上，建议单票至少 80 根日线以上。
+
+---
+
+### 特征工程
+
+核心函数：`compute_indicators(df)`
+
+- 均线与 EMA：`sma5/10/20/60`、`ema12/26`
+- MACD 系列：`dif, dea, macd`
+- 振荡与通道：
+  - RSI(14)：`rsi14`
+  - KDJ(9,3,3)：`kdj_k, kdj_d, kdj_j`
+  - CCI(14)：`cci14`
+  - Williams%R(14)：`wr14`
+  - Bollinger(20,2)：`bb_mid, bb_up, bb_low, bbp`
+- 成交/资金：`obv, obv_ema, mfi14, cmf20`
+- 波动与动量：`ret1, vol20(年化), mom10, ret5/20/60`
+- 位置关系与状态：`above_sma20, dif_pos, macd_up`
+- 振幅与缺口：`range_pct, gap_pct`
+- 流动性与风险：`amt20（近20日均额）, atr14`
+- 趋势/突破相关：`near_high55, dd60, sma20_slope5` 等
+
+训练使用的特征列（`feature_columns()`）：
+- 趋势/均线：sma5,sma10,sma20,sma60, ema12,ema26
+- MACD：dif, dea, macd
+- 震荡：rsi14, kdj_k, kdj_d, kdj_j, cci14, wr14
+- 布林：bb_mid, bbp
+- 成交/资金：v_surge, obv_ema, mfi14, cmf20
+- 波动/动量：vol20, mom10, ret5, ret20, range_pct, gap_pct
+- 位置：above_sma20, dif_pos, macd_up
+- 风险：atr14
+
+训练前处理：
+- 目标收益：未来 \(H\) 日收益 \(y = \frac{Close_{t+H}}{Close_t} - 1\)，并裁剪到 [-0.25, 0.25]
+- 特征极值剪裁（1/99 分位）：rsi14, v_surge, vol20, mom10, macd, dif, dea, bbp, kdj_j, cci14, wr14, range_pct, gap_pct, mfi14, cmf20
+- 标准化：\(X_{std} = (X - \mu) / \sigma\)，保存 \(\mu, \sigma\) 以在线打分
+
+数据最低需求：
+- 训练：单票长度 ≥ max(80, H+40)
+- 扫描：单票长度 ≥ 80
+- 回测：单票长度 ≥ max(60, hold_days+10)
+
+---
+
+### 训练与进化
+
+支持两种模式（页签“训练/进化”）：
+
+1) 岭回归 + 时间序列 CV（`ridge_cv`）
+- 带截距（拦截项不参与正则）。目标可选：
+  - IC：最大化横截面 Rank IC 的验证均值
+  - MSE：最小化均方误差
+- 时间序列 CV：
+  - 按交易日分段，使用前 i 段训练，第 i+1 段验证
+- λ 搜索网格：`[1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1]`
+- 评估并持久化：保存权重与评估指标（IC 均值/标准差/ICIR/MSE/有效天数）
+
+2) 遗传算法（`ga`）特征子集 + λ 进化
+- 个体为特征选择掩码，适应度为验证集 Rank IC 均值
+- 进化参数：种群 `n_pop`、代数 `n_gen`、子集大小约束 `min_feat/max_feat`
+- 交叉、变异并保证子集大小约束，搜索最佳子集与 λ
+- 拟合全样本并持久化
+
+Rank IC 定义（横截面 Spearman）：
+\[
+IC_d = \rho\big(\mathrm{rank}(\hat{y}_d), \mathrm{rank}(y_d)\big), \quad
+IC_{mean} = \frac{1}{D} \sum_{d=1}^{D} IC_d
+\]
+其中 \(d\) 为交易日维度；每个交易日要求样本数 ≥ 5。
+
+模型方程（岭回归）：
+\[
+y \approx X w + b, \quad \arg\min_{w,b}\|y - Xw - b\mathbf{1}\|_2^2 + \lambda \|w\|_2^2
+\]
+拦截 \(b\) 不正则化。
+
+---
+
+### 自选建议（扩展建议/仓位止损止盈）
+
+生成过程（可无权重）：
+- 分数优先使用训练权重，否则使用“基线打分”
+- 生成扩展建议项：
+  - 止损：`stop = min(close*0.95, close - 1.5*ATR14)`（至少 -5%）
+  - 止盈：`target = close + max(2.5*ATR, (close-stop)*1.5)`
+  - 仓位比例：`pos_pct = min(30%, risk_pct / 跌幅%)`，其中 `跌幅% = (close - stop)/close`
+  - 数量：按 100 股一手取整
+  - 建议类型：`score>0 且 mom10≥-2%` -> “买入”，否则“观望”  
+- 同时写入历史表 `advice`，便于后续绩效评估
+
+“基线打分”（无模型时）核心思路：鼓励中短期动量、低波动、接近 55 日高、趋势成立，抑制高波动。
+
+---
+
+### 市场扫描（无权重亦可）
+
+- 股票池：HS300/ZZ500/SZ50/ALL/CUSTOM
+- 控制项：
+  - 是否跳过增量更新（ALL 场景建议开启以提速）
+  - 批处理大小与间隔（ALL 扫描限流）
+  - 流动性阈值：近 20 日均额 `amt20 >= min_amt20`
+  - 高级过滤：趋势（价>SMA20>SMA60 且 MACD>0 且 SMA20 上行）、接近 55 日高（≥98%）、波动 z 分上限、RSI 区间
+- 打分：
+  - 若有权重：标准化后线性打分
+  - 否则：基线打分
+- 质量分 qscore（用于排序，默认 TopN）：
+\[
+qscore = 0.5\cdot score\_z + 0.25\cdot mom\_z - 0.25\cdot vol\_z + 0.12\cdot trend + 0.08\cdot breakout55 + 0.05\cdot dd60
+\]
+其中各项为：score、mom10、vol20 的 z 分，trend（布尔）、breakout55（布尔）、dd60（[-1,0]，负值为回撤）
+
+- 扩展建议：对扫描结果逐条生成并展示仓位/止损/止盈/数量，支持导出 CSV，同时写入 `advice` 历史
+
+---
+
+### 回测（TopN 等权 + H 日持有）
+
+- 每持有期（`hold_days`）调仓一次
+- 当日根据打分（权重或基线）选 TopN 等权持有下一期
+- 期收益：简单 `Close_{t+H}/Close_t - 1`，扣除双边手续费 `fee_bps/10000 * 2`
+- 流动性过滤：`amt20 >= min_amt20`
 - 输出：
   - 期收益表（date, ret）
-  - 净值曲线与指标（CAGR/MaxDD/Sharpe/胜率）
-- 自动弹窗绘制净值曲线
+  - 净值曲线 `nav = cumprod(1+ret)`
+  - 指标（按持有期为一个周期年化）：
+    - 年化收益 CAGR
+    - 最大回撤 MaxDD
+    - 夏普比率 Sharpe
+    - 胜率 WinRate
 
-### 4.6 绩效 / 历史
-- 历史建议检索：按日期/类型（买/卖/全部）/H（日）
-- 统计：
-  - 分类（买/卖/强烈买入/强烈卖出/观望）绩效
-  - 按 score 分位组（q 组）平均收益与胜率
-  - 签名收益分布直方图
-- 查看与导出历史记录
-
-### 4.7 图表
-- 绘制单股指标图：价格+SMA/BOLL、MACD、RSI
-
-### 4.8 用户操作
-- 记录 BUY/SELL/ADJ 行为（日期/价格/数量/备注）
-- 支持刷新查看
+指标计算要点：
+- 年化：以 252 交易日换算，周期为 hold_days
+- MaxDD：按净值序列对峰值回撤
+- Sharpe：使用周期收益的均值与标准差，按年化换算
 
 ---
 
-## 5. 因子与模型原理
+### 绩效评估与历史
 
-### 5.1 技术指标与特征列
+- 历史建议绩效（可按日期、类型 BUY/SELL、H 日）：
+  - 将“卖出”建议对应收益取负，统计平均收益与胜率
+- 分位统计：
+  - 将 score 分为 q 分位，统计每组平均收益与胜率（买卖混合为签名收益）
+- 收益分布图：
+  - 绘制历史建议 H 日后收益直方图（便于观察偏度与尾部）
 
-- 趋势/均线：sma5, sma10, sma20, sma60, ema12, ema26
-- MACD 系：dif, dea, macd
-- 震荡类：rsi14, kdj_k, kdj_d, kdj_j, cci14, wr14
-- 布林带：bb_mid, bbp
-- 成交/资金：v_surge（量比）、obv_ema、mfi14、cmf20
-- 波动/动量：vol20（年化近 20 日波动）、mom10、ret5、ret20、range_pct、gap_pct
-- 位置特征：above_sma20、dif_pos、macd_up
-- 风险：atr14
-- 其它中间量（用于质量分与扩展建议）：amt20、near_high55、dd60、sma20_slope5 等
-
-特征预处理：
-- y（未来 H 日收益）裁剪到 [-25%, 25%]
-- 若干特征进行 1%/99% 分位剪裁（去极值）
-- 标准化：\( x' = (x - \mu) / \sigma \)，保存 \(\mu,\sigma\)
-
-### 5.2 目标与评估
-
-- 横截面 Rank IC（斯皮尔曼相关）
-  - 对每个交易日 d，计算当日所有股票预测分与真实未来收益的秩相关
-  - 汇总得到平均 IC、标准差、ICIR
-- 时间序列交叉验证（ts_cv_splits）
-  - 按日期顺序切分：前若干段为训练，后一段为验证，保持时间因果
-
-IC 计算公式（简化表示）：
-\[
-\text{IC}_d = \rho(\text{rank}(\hat{y}_d),\, \text{rank}(y_d))
-\]
-\[
-\text{ICIR} = \frac{\overline{\text{IC}}}{\sigma(\text{IC}) + \varepsilon}
-\]
-
-- Ridge 回归（带截距，截距不正则）：
-  - \( \min\limits_{w,b} \|y - (Xw + b)\|_2^2 + \lambda \|w\|_2^2 \)
-
-### 5.3 遗传算法（GA）选特征 + λ
-
-- 个体表示：特征子集（布尔掩码）+ λ
-- 初始随机族群（受 min_feat/max_feat 约束）
-- 适应度：时间序列 CV 上的平均横截面 Rank IC
-- 进化操作：
-  - 选择（锦标赛或排序挑选）
-  - 交叉（单点）与变异（按位翻转）
-  - 弹性修正（保证特征数在 [min_feat, max_feat]）
-- 输出：最佳子集与 λ；在全样本重训并评估
-
-建议：
-- 初期使用 `min_feat=6 ~ 12, max_feat≤20`，`n_pop=24, n_gen=8`，平衡速度与效果
+同时支持导出建议历史 CSV（附带股票名称）。
 
 ---
 
-## 6. 建议与“扩展建议”策略
+### 用户操作记录
 
-### 6.1 基线打分（无模型时）
-- 鼓励中短期动量、低波动、接近 55 日高、趋势成立
-- 形式（简化）：
-  \[
-  s \approx 0.8 \cdot \text{mom10} - 0.15 \cdot \text{vol20} + 0.2 \cdot (\text{near\_high55}-0.9) + 0.05 \cdot \tanh(\text{macd}) + 0.1 \cdot \text{trend}
-  \]
-
-### 6.2 文本建议分级（score_to_advice）
-- 阈值：pos_thr=0.02，neg_thr=-0.02
-- 规则：
-  - ≥1.5×pos_thr：强烈买入
-  - ≥pos_thr：买入
-  - ≤1.5×neg_thr：强烈卖出
-  - ≤neg_thr：卖出
-  - 否则：观望
-
-### 6.3 扩展建议（位置、止损、止盈、数量）
-- 止损：
-  - 若 ATR14>0：`stop = min(close*0.95, close - 1.5*ATR14)`（至少 -5%）
-  - 否则：`stop = close * 0.95`
-- 目标：
-  - `target = close + max(2.5*ATR14, (close - stop) * 1.5)`
-- 仓位（单笔风险控制）：
-  - 跌幅％：`drop_pct = (close - stop)/close`
-  - \( \text{pos\_pct} = \min(30\%, \text{risk\_pct} / \text{drop\_pct}) \)
-- 数量：按 100 股为一手向下取整
-- 建议类型：若 score>0 且 mom10≥-2% → 买入，否则观望
+- 记录日常交易行为：BUY/SELL/ADJ、价格、数量、备注
+- 展示最近 300 条，长期留痕便于复盘与数据对齐
 
 ---
 
-## 7. 市场扫描与质量分
+### 图表与可视化
 
-- 质量分 qscore：
-  \[
-  \text{qscore} = 0.5 \cdot z(\text{score}) + 0.25 \cdot z(\text{mom10}) - 0.25 \cdot z(\text{vol20}) + 0.12 \cdot \text{trend} + 0.08 \cdot \text{breakout55} + 0.05 \cdot \text{dd60}
-  \]
-  - 其中 z(·) 为当期截面标准化
-  - dd60 ∈ [-1,0] 回撤项，负值相当于惩罚深回撤（直接相加）
-- 排序：按 qscore、score、mom10 三重排序
-- 高级筛选：可先以 vol_z 和 RSI 范围预筛后排序
+- 单票绘图：收盘 + SMA20/60 + BOLL（上下轨），下方 MACD 柱 + DIF/DEA
+- 操作入口：页签“图表”
 
 ---
 
-## 8. 回测框架与指标
+## 模型与指标细节
 
-- 步骤
-  1) 预载所有股票的指标数据
-  2) 生成调仓日期序列：每 hold_days 取一个 d，确保未来 d+H 存在数据
-  3) 每期 d：
-     - 流动性过滤：amt20≥阈值
-     - 打分：模型预测或基线打分
-     - 选 TopN 等权
-     - 收益：d→d+H 的收盘收益，减去进出双边费用
-  4) 聚合为期收益表 pr (date, ret)，累计为净值 nav
+- Rank Spearman IC（横截面）：
+  - 对同一交易日的预测与真实未来收益进行排名，再计算皮尔逊相关
+  - 稳健性：当标准差近零（所有排名相同）返回 NaN（训练中会跳过）
+- 时间序列 CV 切分：
+  - 将全部交易日均分为 `n_folds` 段
+  - 第 i 折用前 i 段合并做训练，第 i+1 段作为验证，保持时间顺序
+- 标准化与在线打分：
+  - 训练时保存的 `mu/sigma` 用于推断期标准化，确保一致性
+- 建议信号说明（示例）：
+  - 规则型解释：如“股价站上SMA20”“MACD红柱”“DIF>0”“RSI超卖/超买”“动量10日：xx%”“放量”
 
-- 指标
-  - 日/期胜率：收益>0 的占比
-  - CAGR（以 252 交易日年化）：
-    \[
-    \text{CAGR} = \text{NAV}_{\text{last}}^{\frac{252}{\text{total\_days}}} - 1
-    \]
-  - 最大回撤 MaxDD：
-    \[
-    \text{MaxDD} = \min_t \left( \frac{\text{NAV}_t}{\max_{s\le t}\text{NAV}_s} - 1 \right)
-    \]
-  - Sharpe（以持有期为一个“周期”近似年化）：
-    \[
-    \text{Sharpe} = \frac{\overline{r}}{\sigma(r) + \varepsilon} \cdot \sqrt{\frac{252}{\text{period\_days}}}
-    \]
-
-提示：
-- 该回测为简化版，未包含成交/停牌/滑点等微观约束，仅用于快速迭代评估
+分数→建议（用于“买入/卖出/观望”标签）：
+- `score_to_advice` 默认阈值：`pos_thr=0.02`，`neg_thr=-0.02`
+  - 分数 ≥ 0.03：“强烈买入”，≥ 0.02：“买入”
+  - 分数 ≤ -0.03：“强烈卖出”，≤ -0.02：“卖出”
+  - 其他：“观望”
 
 ---
 
-## 9. 数据库结构（SQLite）
+## 权重导入导出与格式
 
-默认库：`advisor.db`
+- 导出最新权重：菜单“文件 → 导出最新权重…（JSON）”
+- 导入权重：菜单“文件 → 导入权重…（JSON）”，会写入 `weights` 并更新 `meta.latest_weights_ts`
 
-- prices（K 线）
-  - 主键：(code, date)
-  - 字段：open, high, low, close, volume, amount
-  - 索引：date、code
-- advice（建议记录）
-  - id, date, code, score, advice, reasoning, horizon
-- weights（最新模型权重）
-  - timestamp 主键，horizon, features(json), weights(json), intercept, mu(json), sigma(json), lambda, notes
-- meta
-  - key 主键, value（如 latest_weights_ts）
-- stock_names
-  - code 主键, name
-- user_ops（用户操作）
-  - id, date, code, action(BUY/SELL/ADJ), price, qty, note
+JSON 结构示例：
+```json
+{
+  "timestamp": "2025-09-25 14:30:00",
+  "horizon": 10,
+  "features": ["sma5", "sma10", "..."],
+  "weights": [0.01, -0.02, "..."],
+  "intercept": 0.0005,
+  "mu": [1.23, 4.56, "..."],
+  "sigma": [0.78, 0.12, "..."],
+  "lambda": 0.01,
+  "notes": "imported or training metadata json"
+}
+```
 
-备份建议：
-- 直接拷贝 `advisor.db` 文件即可备份/迁移
-
----
-
-## 10. 实操建议与常见用法
-
-- 股票池选择
-  - 训练与回测尽量使用“稳定、流动性较好”的成分（如 HS300/ZZ500）
-  - 自定义池可按行业/主题分类使用
-- 训练窗口
-  - 建议至少覆盖 3~5 年交易日，样本越多越稳定
-- H（日）选择
-  - 短中期（10~20 日）更适合技术因子；更长期需引入基本面/财务因子
-- ALL 扫描优化
-  - 勾选“跳过增量更新”，加快扫描，后续再批量更新
-  - 适当提高“近20日均额阈值”，减少长尾小票
-- 风险控制
-  - risk_pct 建议 ≤ 1%，避免大波动 ATR 导致过大仓位
-  - 止损与目标价仅为参考，实盘需结合个股特性与风控制度
+注意：`features/mu/sigma/weights` 维度必须一致；导入后会作为新的最新权重参与扫描/建议/回测。
 
 ---
 
-## 11. 已知问题与修复建议
+## 配置与日志
 
-- 扫描结果插入 Treeview 时，values 末尾重复附加了 `advice` 和 `reasoning`（导致列数与值数不对齐风险）
-  - 位置：`on_scan_market_async → self.scan_tree.insert(...)`
-  - 建议修复：删除重复的两个参数，仅保留一次
-  - 修复示例（仅保留一次 advice/reasoning）：
-    ```python
-    self.scan_tree.insert("", tk.END, values=(
-        r["date"], r["code"], r.get("name",""), f"{r['close']:.2f}",
-        f"{r['score']:.4f}", f"{r['qscore']:.4f}",
-        f"{r['mom10']:.2%}", f"{r['vol20']:.3f}",
-        f"{r['atr14']:.3f}", f"{r['amt20']:.0f}",
-        f"{r.get('trend',0):.0f}", f"{r.get('breakout55',0):.0f}", f"{r.get('dd60',0):.2%}",
-        f"{r['pos_pct'] * 100:.1f}%", f"{r['stop']:.2f}", f"{r['target']:.2f}", int(r["qty"]),
-        r["advice"], r["reasoning"]
-    ))
-    ```
-- 字体/后端
-  - 若 matplotlib TkAgg 报错，请安装 Tk 或更换后端（需配合 tkinter GUI）
+- 配置文件：`advisor_config.json`
+  - 自动保存绝大多数 GUI 参数（日期、H、训练/扫描/回测配置、主题等）
+  - 自定义股票池文件路径仅记录但不自动重新载入（避免路径失效）
+- 日志文件：`advisor.log`
+  - 记录关键操作与错误，便于排查
 
 ---
 
-## 12. 扩展开发指南
+## 性能优化建议
 
-- 增加/调整因子
-  - 在 `compute_indicators` 中新增列，并在 `feature_columns()` 中选择是否纳入模型
-  - 记得在训练数据构造与剪裁环节考虑新因子的极值处理
-- 增加目标与评估指标
-  - 可添加信息系数的“稳定性”约束、分行业中性化等
-- 强化回测
-  - 引入开盘交易、成交量/停牌过滤、分红送配处理、仓位动态调整
-- 策略集成
-  - 将 “质量分 + 风险控制 + 动量” 结合，形成多因子打分与分层持仓
-- 更换数据源
-  - 如需更换为 tushare/wind 等，替换“数据获取”和“名称缓存”层逻辑
-
----
-
-## 13. 故障排查（FAQ）
-
-- baostock 登录失败/未安装
-  - 执行：`pip install baostock`，重启程序
-  - 若接口报错/限频，可稍后再试；程序内部已做重试与 sleep
-- 无法拉取指数成分（离线/未登录）
-  - 离线模式无法从指数拉取，建议先在有网环境更新并缓存数据
-- ALL 扫描很慢
-  - 勾选“跳过增量更新”
-  - 减少股票池或提高 amt20 门槛
-  - 调整 batch_size、sleep_ms，降低接口压力
-- 中文乱码
-  - 安装中文字体或者修改 `plt.rcParams["font.family"]` 为系统已装字体
+- ALL 扫描时：
+  - 勾选“扫描前跳过增量更新（快）”
+  - 调整批大小与批间隔（接口限流）
+  - 提高 `min_amt20` 限制，减少低流动性标的
+- 训练/进化：
+  - 先用 `ridge_cv` 粗选，IC 目标 + 合理折数
+  - 再用 `ga` 在较小/精选股票池上搜索特征子集，提升性价比
+- 数据：
+  - 定期增量更新本地 DB，避免每次都拉全量
+- 绘图：
+  - 数据不足（如滚动窗口前期 NaN）会被自动过滤，保证图表可读性
 
 ---
 
-## 14. 免责声明
+## 常见问题 FAQ
+
+- Q：baostock 登录失败或未安装？
+  - A：`pip install baostock`，网络不佳可重试。未安装/未登录时进入离线模式，仅使用本地数据。
+- Q：ALL 扫描太慢？
+  - A：勾选“跳过增量更新”，提高 `min_amt20`，调大批大小（同时适当延时），必要时改用指数成分列表。
+- Q：代码格式校验失败？
+  - A：支持 `600000 / sh.600000 / 600000.SH`，会自动归一化；确保 6 位数字与交易所匹配（6→sh，0/3→sz）。
+- Q：训练数据不足？
+  - A：单票至少 ~80 根日线；训练期尽量覆盖 horizon + 40 以上；检查日期范围与复权方式一致性。
+- Q：回测无结果？
+  - A：确保股票池在回测日期内有足够样本；`min_amt20` 不要设置过高；`hold_days` 不宜超过总样本周期。
+- Q：中文不显示或乱码？
+  - A：确认系统已安装中文字体；或修改 `plt.rcParams["font.family"]` 指定可用中文字体。
+- Q：如何清空或重建数据库？
+  - A：关闭程序后删除 `advisor.db`（会丢失历史与权重记录），重启会自动初始化表结构。
+
+---
+
+## 风险提示与免责声明
 
 - 本程序仅用于教育与研究，不构成任何投资建议。
-- 历史回测与模拟不代表未来表现，实盘有交易成本、流动性、滑点、停牌等诸多因素影响。
-- 使用者需自行承担交易风险。
+- 历史回测与模拟结果不代表未来表现，市场有风险，投资需谨慎。
+- 使用 baostock 等第三方数据源请遵守其服务条款与访问限制。
 
 ---
 
-## 15. 快速命令备忘
+## 附录：关键公式与实现要点
 
-- 安装依赖
-  ```bash
-  pip install baostock pandas numpy matplotlib
-  # Linux/macOS 若缺少 Tk:
-  # Ubuntu/Debian: sudo apt-get install python3-tk
-  # macOS: brew 安装或使用 conda 的 tk 包
-  ```
-- 运行
-  ```bash
-  python a_share_evo_advisor.py
-  ```
+- 横截面 Rank IC（每个交易日）：
+\[
+IC_d = \frac{\sum_i (r_i - \bar{r})(q_i - \bar{q})}{\sqrt{\sum_i (r_i-\bar{r})^2}\sqrt{\sum_i (q_i-\bar{q})^2}}
+\]
+其中 \(r_i\) 为预测值的名次，\(q_i\) 为真实收益的名次。
+
+- qscore 组合：
+\[
+qscore = 0.5\cdot score\_z + 0.25\cdot mom\_z - 0.25\cdot vol\_z + 0.12\cdot trend + 0.08\cdot breakout55 + 0.05\cdot dd60
+\]
+
+- 头寸建议：
+  - 跌幅比：\(\mathrm{drop\_pct} = \frac{close - stop}{close}\)
+  - 仓位：\(\mathrm{pos\_pct} = \min(0.3, \frac{\mathrm{risk\_pct}}{\mathrm{drop\_pct}})\)
+
+- 回测指标（周期 = hold_days）：
+  - 年化收益：\(\mathrm{CAGR} = \mathrm{NAV}_{end}^{252 / N} - 1\)，\(N\) 为净值点数
+  - 最大回撤：\(\min(\mathrm{NAV}/\mathrm{cummax(NAV)} - 1)\)
+  - 夏普比率：\(\mathrm{Sharpe} = \frac{\mu \cdot (252/hold\_days)}{\sigma \cdot \sqrt{252/hold\_days}}\)
+
+---
+
+如需二次开发或部署到服务器侧（无 GUI 场景），可将核心函数（数据、特征、训练、扫描、回测、评估）封装为服务接口或脚本任务，GUI 相关类 `EvoAdvisorApp` 可按需裁剪。欢迎基于此框架继续进化（特征工程、目标函数、交易逻辑、风险控制）。祝研究顺利！

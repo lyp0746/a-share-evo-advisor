@@ -7,3 +7,6 @@ matplotlib>=3.5
 
 # 数据源
 baostock>=0.8.8
+
+# 打包exe
+pyinstaller>=4.10
